@@ -161,7 +161,7 @@ gst-launch-1.0 -e \
             mesh-size=${MESH_X},${MESH_Y} ! \
             identity sync=false ! videoconvert ! videorate ! \
             video/x-raw,framerate=$FRAMERATE/1,width=$VIDEO_WIDTH,height=$VIDEO_HEIGHT ! \
-            x264enc bitrate=$(($BITRATE * 200)) key-int-max=120 speed-preset=$SPEED_PRESET pass=cbr rc-lookahead=40 ! \
+            x264enc quantizer=35 key-int-max=30 speed-preset=ultrafast threads=1 qp-max=50 ! \
             video/x-h264,stream-format=avc,alignment=au ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
 
