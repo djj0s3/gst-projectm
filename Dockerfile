@@ -50,8 +50,8 @@ RUN mkdir build && \
     cd build && \
     cmake -DCMAKE_BUILD_TYPE=Release .. && \
     make
-RUN mkdir -p /usr/lib/x86_64-linux-gnu/gstreamer-1.0/ && \
-    cp build/libgstprojectm.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/ && \
+RUN mkdir -p $(pkg-config --variable=pluginsdir gstreamer-1.0) && \
+    cp build/libgstprojectm.so $(pkg-config --variable=pluginsdir gstreamer-1.0)/ && \
     rm -rf /tmp/gst-projectm
 
 # Clean up unnecessary packages to reduce image size
