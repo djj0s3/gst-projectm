@@ -4,9 +4,9 @@ set -e
 # Default values
 PRESET_PATH="/usr/local/share/projectM/presets"
 TEXTURE_DIR="/usr/local/share/projectM/textures"
-PRESET_DURATION=4
-MESH_X=256
-MESH_Y=144
+PRESET_DURATION=60
+MESH_X=128
+MESH_Y=72
 VIDEO_WIDTH=1920
 VIDEO_HEIGHT=1080
 FRAMERATE=60
@@ -161,7 +161,7 @@ gst-launch-1.0 -e \
             mesh-size=${MESH_X},${MESH_Y} ! \
             identity sync=false ! videoconvert ! videorate ! \
             video/x-raw,framerate=$FRAMERATE/1,width=$VIDEO_WIDTH,height=$VIDEO_HEIGHT ! \
-            x264enc quantizer=35 key-int-max=30 speed-preset=ultrafast threads=1 qp-max=50 ! \
+            x264enc quantizer=42 key-int-max=60 speed-preset=ultrafast threads=1 qp-max=51 ! \
             video/x-h264,stream-format=avc,alignment=au ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
 
