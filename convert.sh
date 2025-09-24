@@ -147,6 +147,11 @@ fi
 # Wait a moment for Xvfb to start
 sleep 1
 
+TIMELINE_PROPERTY=""
+if [ ! -z "$TIMELINE_FILE" ]; then
+    TIMELINE_PROPERTY="timeline-path=$TIMELINE_FILE"
+fi
+
 # Run the actual conversion
 gst-launch-1.0 -e \
   filesrc location=$INPUT_FILE ! \
@@ -157,6 +162,7 @@ gst-launch-1.0 -e \
       t. ! queue ! audioconvert ! projectm \
             preset=$PRESET_PATH \
             texture-dir=$TEXTURE_DIR \
+            $TIMELINE_PROPERTY \
             preset-duration=$PRESET_DURATION \
             mesh-size=${MESH_X},${MESH_Y} ! \
             identity sync=false ! videoconvert ! videorate ! \
