@@ -12,6 +12,7 @@ VIDEO_HEIGHT=1080
 FRAMERATE=60
 BITRATE=8000
 SPEED_PRESET="medium"
+TIMELINE_FILE=""
 
 # Process ID for the gst-launch process
 GST_PID=""
@@ -54,6 +55,7 @@ show_help() {
     echo "  -b, --bitrate KBPS     Output video bitrate in kbps (default: $BITRATE)"
     echo "  --speed PRESET         x264 encoding speed preset (default: $SPEED_PRESET)"
     echo "                         Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow"
+    echo "  --timeline FILE        Optional preset timeline file (.ini)"
     echo "  -h, --help             Display this help message and exit"
     echo ""
     echo "Example:"
@@ -110,6 +112,10 @@ while [[ $# -gt 0 ]]; do
             SPEED_PRESET="$2"
             shift 2
             ;;
+        --timeline)
+            TIMELINE_FILE="$2"
+            shift 2
+            ;;
         -h|--help)
             show_help
             ;;
@@ -142,10 +148,18 @@ if [ -z "$INSIDE_DOCKER" ]; then
     echo "Framerate: $FRAMERATE fps"
     echo "Bitrate: $BITRATE kbps"
     echo "Encoding speed: $SPEED_PRESET"
+    if [ ! -z "$TIMELINE_FILE" ]; then
+        echo "Timeline: $TIMELINE_FILE"
+    fi
 fi
 
 # Wait a moment for Xvfb to start
 sleep 1
+
+TIMELINE_PROPERTY=""
+if [ ! -z "$TIMELINE_FILE" ]; then
+    TIMELINE_PROPERTY="timeline-path=$TIMELINE_FILE"
+fi
 
 # Run the actual conversion
 gst-launch-1.0 -e \
@@ -157,11 +171,12 @@ gst-launch-1.0 -e \
       t. ! queue ! audioconvert ! projectm \
             preset=$PRESET_PATH \
             texture-dir=$TEXTURE_DIR \
+            $TIMELINE_PROPERTY \
             preset-duration=$PRESET_DURATION \
             mesh-size=${MESH_X},${MESH_Y} ! \
             identity sync=false ! videoconvert ! videorate ! \
             video/x-raw,framerate=$FRAMERATE/1,width=$VIDEO_WIDTH,height=$VIDEO_HEIGHT ! \
-            x264enc bitrate=$(($BITRATE * 1000)) key-int-max=200 speed-preset=$SPEED_PRESET ! \
+            x264enc bitrate=$BITRATE key-int-max=200 speed-preset=$SPEED_PRESET ! \
             video/x-h264,stream-format=avc,alignment=au ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
 

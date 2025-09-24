@@ -17,6 +17,7 @@ struct _GstProjectM {
 
   gchar *preset_path;
   gchar *texture_dir_path;
+  gchar *timeline_path;
 
   gfloat beat_sensitivity;
   gdouble hard_cut_duration;
@@ -61,6 +62,8 @@ static void gst_projectm_class_init(GstProjectMClass *klass);
 static gboolean plugin_init(GstPlugin *plugin);
 
 static gboolean gst_projectm_setup(GstGLBaseAudioVisualizer *glav);
+
+gboolean gst_projectm_timeline_is_active(GstProjectM *plugin);
 
 G_END_DECLS
 

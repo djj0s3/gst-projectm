@@ -34,7 +34,16 @@ projectm_handle projectm_init(GstProjectM *plugin) {
     GST_DEBUG_OBJECT(plugin, "Created projectM instance!");
   }
 
-  if (plugin->enable_playlist) {
+  gboolean timeline_active = gst_projectm_timeline_is_active(plugin);
+  gboolean use_playlist = plugin->enable_playlist && !timeline_active;
+
+  if (timeline_active) {
+    GST_INFO_OBJECT(plugin,
+                    "Timeline-driven preset sequencing enabled; disabling "
+                    "playlist shuffling");
+  }
+
+  if (use_playlist) {
     GST_DEBUG_OBJECT(plugin, "Playlist enabled");
 
     // initialize preset playlist
@@ -72,11 +81,17 @@ projectm_handle projectm_init(GstProjectM *plugin) {
       plugin->enable_playlist, plugin->shuffle_presets);
 
   // Load preset file if path is provided
-  if (plugin->preset_path != NULL) {
+  if (plugin->preset_path != NULL && playlist != NULL) {
     int added_count =
         projectm_playlist_add_path(playlist, plugin->preset_path, true, false);
     GST_INFO("Loaded preset path: %s, presets found: %d", plugin->preset_path,
              added_count);
+  } else if (plugin->preset_path != NULL && playlist == NULL &&
+             !timeline_active) {
+    GST_INFO(
+        "Preset directory provided (%s) but playlist is disabled; timeline "
+        "or direct preset loading will handle switching",
+        plugin->preset_path);
   }
 
   // Set texture search path if directory path is provided
@@ -93,7 +108,7 @@ projectm_handle projectm_init(GstProjectM *plugin) {
   projectm_set_soft_cut_duration(handle, plugin->soft_cut_duration);
 
   // Set preset duration, or set to in infinite duration if zero
-  if (plugin->preset_duration > 0.0) {
+  if (plugin->preset_duration > 0.0 && playlist != NULL) {
     projectm_set_preset_duration(handle, plugin->preset_duration);
 
     // kick off the first preset

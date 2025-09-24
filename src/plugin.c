@@ -6,6 +6,7 @@
 #ifdef USE_GLEW
 #include <GL/glew.h>
 #endif
+#include <glib/gstdio.h>
 #include <gst/gl/gstglfuncs.h>
 #include <gst/gst.h>
 #include <gst/pbutils/gstaudiovisualizer.h>
@@ -23,12 +24,35 @@
 GST_DEBUG_CATEGORY_STATIC(gst_projectm_debug);
 #define GST_CAT_DEFAULT gst_projectm_debug
 
+typedef struct {
+  gdouble start_time;
+  gdouble duration;
+  gdouble end_time;
+  gchar *preset;
+  gchar *complexity;
+} GstProjectMTimelineEntry;
+
+static void gst_projectm_timeline_entry_free(gpointer data);
+static void gst_projectm_timeline_reset(GstProjectM *plugin);
+static gboolean gst_projectm_load_timeline(GstProjectM *plugin,
+                                           const gchar *path);
+static void gst_projectm_activate_timeline(GstProjectM *plugin);
+static void gst_projectm_timeline_update(GstProjectM *plugin,
+                                         gdouble elapsed_seconds);
+static gchar *gst_projectm_resolve_preset_path(GstProjectM *plugin,
+                                               const gchar *preset_value);
+
 struct _GstProjectMPrivate {
   GLenum gl_format;
   projectm_handle handle;
 
   GstClockTime first_frame_time;
   gboolean first_frame_received;
+
+  GPtrArray *timeline_entries;
+  gint current_timeline_index;
+  gboolean timeline_active;
+  gboolean timeline_initialized;
 };
 
 G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
@@ -37,6 +61,321 @@ G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
                             GST_DEBUG_CATEGORY_INIT(gst_projectm_debug,
                                                     "gstprojectm", 0,
                                                     "Plugin Root"));
+
+static void gst_projectm_timeline_entry_free(gpointer data) {
+  GstProjectMTimelineEntry *entry = (GstProjectMTimelineEntry *)data;
+  if (entry == NULL) {
+    return;
+  }
+
+  g_clear_pointer(&entry->preset, g_free);
+  g_clear_pointer(&entry->complexity, g_free);
+  g_free(entry);
+}
+
+static gint gst_projectm_timeline_entry_compare(gconstpointer a,
+                                                gconstpointer b) {
+  const GstProjectMTimelineEntry *left =
+      (const GstProjectMTimelineEntry *)a;
+  const GstProjectMTimelineEntry *right =
+      (const GstProjectMTimelineEntry *)b;
+
+  if (left->start_time < right->start_time) {
+    return -1;
+  }
+  if (left->start_time > right->start_time) {
+    return 1;
+  }
+  return 0;
+}
+
+static void gst_projectm_timeline_reset(GstProjectM *plugin) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (priv->timeline_entries != NULL) {
+    g_ptr_array_set_size(priv->timeline_entries, 0);
+  }
+
+  priv->current_timeline_index = -1;
+  priv->timeline_active = FALSE;
+  priv->timeline_initialized = FALSE;
+
+  if (priv->handle != NULL) {
+    projectm_set_preset_locked(priv->handle, plugin->preset_locked);
+
+    if (plugin->preset_duration > 0.0) {
+      projectm_set_preset_duration(priv->handle, plugin->preset_duration);
+    } else {
+      projectm_set_preset_duration(priv->handle, 999999.0);
+    }
+  }
+}
+
+static gchar *gst_projectm_resolve_preset_path(GstProjectM *plugin,
+                                               const gchar *preset_value) {
+  if (preset_value == NULL || *preset_value == '\0') {
+    return NULL;
+  }
+
+  if (g_path_is_absolute(preset_value)) {
+    return g_strdup(preset_value);
+  }
+
+  if (plugin->preset_path != NULL) {
+    return g_canonicalize_filename(preset_value, plugin->preset_path);
+  }
+
+  return g_strdup(preset_value);
+}
+
+static gboolean gst_projectm_load_timeline(GstProjectM *plugin,
+                                           const gchar *path) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  gst_projectm_timeline_reset(plugin);
+
+  if (path == NULL) {
+    GST_DEBUG_OBJECT(plugin,
+                     "Timeline path cleared; using internal preset switching");
+    return FALSE;
+  }
+
+  if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+    GST_WARNING_OBJECT(plugin, "Timeline file not found: %s", path);
+    return FALSE;
+  }
+
+  GKeyFile *key_file = g_key_file_new();
+  GError *error = NULL;
+
+  if (!g_key_file_load_from_file(key_file, path, G_KEY_FILE_NONE, &error)) {
+    GST_WARNING_OBJECT(plugin, "Failed to parse timeline file %s: %s", path,
+                       error != NULL ? error->message : "unknown error");
+    g_clear_error(&error);
+    g_key_file_free(key_file);
+    return FALSE;
+  }
+
+  gsize group_count = 0;
+  gchar **groups = g_key_file_get_groups(key_file, &group_count);
+
+  if (groups == NULL || group_count == 0) {
+    GST_WARNING_OBJECT(plugin, "Timeline file %s contains no segments", path);
+    g_strfreev(groups);
+    g_key_file_free(key_file);
+    return FALSE;
+  }
+
+  for (gsize i = 0; i < group_count; i++) {
+    const gchar *group = groups[i];
+    gboolean segment_valid = TRUE;
+
+    GError *value_error = NULL;
+    gdouble start =
+        g_key_file_get_double(key_file, group, "start", &value_error);
+    if (value_error != NULL) {
+      GST_WARNING_OBJECT(plugin,
+                         "Timeline segment '%s' missing valid 'start': %s",
+                         group, value_error->message);
+      g_clear_error(&value_error);
+      segment_valid = FALSE;
+    }
+
+    gdouble duration = 0.0;
+    if (segment_valid) {
+      duration =
+          g_key_file_get_double(key_file, group, "duration", &value_error);
+      if (value_error != NULL) {
+        GST_WARNING_OBJECT(plugin,
+                           "Timeline segment '%s' missing valid 'duration': "
+                           "%s",
+                           group, value_error->message);
+        g_clear_error(&value_error);
+        segment_valid = FALSE;
+      } else if (duration <= 0.0) {
+        GST_WARNING_OBJECT(plugin,
+                           "Timeline segment '%s' has non-positive duration",
+                           group);
+        segment_valid = FALSE;
+      }
+    }
+
+    gchar *preset = NULL;
+    if (segment_valid) {
+      preset = g_key_file_get_string(key_file, group, "preset", &value_error);
+      if (value_error != NULL || preset == NULL || *preset == '\0') {
+        GST_WARNING_OBJECT(plugin,
+                           "Timeline segment '%s' missing valid 'preset'",
+                           group);
+        g_clear_error(&value_error);
+        g_clear_pointer(&preset, g_free);
+        segment_valid = FALSE;
+      }
+    }
+
+    gchar *complexity = NULL;
+    if (segment_valid) {
+      complexity =
+          g_key_file_get_string(key_file, group, "complexity", NULL);
+      if (complexity != NULL && *complexity == '\0') {
+        g_clear_pointer(&complexity, g_free);
+      }
+    }
+
+    if (!segment_valid) {
+      continue;
+    }
+
+    GstProjectMTimelineEntry *entry = g_new0(GstProjectMTimelineEntry, 1);
+    entry->start_time = start;
+    entry->duration = duration;
+    entry->end_time = start + duration;
+    entry->preset = preset;
+    entry->complexity = complexity;
+
+    g_ptr_array_add(priv->timeline_entries, entry);
+  }
+
+  g_strfreev(groups);
+  g_key_file_free(key_file);
+
+  if (priv->timeline_entries->len == 0) {
+    GST_WARNING_OBJECT(plugin, "Timeline file %s did not yield any segments",
+                       path);
+    return FALSE;
+  }
+
+  g_ptr_array_sort(priv->timeline_entries,
+                   (GCompareFunc)gst_projectm_timeline_entry_compare);
+
+  priv->timeline_active = TRUE;
+  priv->timeline_initialized = FALSE;
+  priv->current_timeline_index = -1;
+
+  GST_INFO_OBJECT(plugin, "Timeline ready with %u segments",
+                  priv->timeline_entries->len);
+
+  return TRUE;
+}
+
+static void gst_projectm_activate_timeline(GstProjectM *plugin) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!priv->timeline_active || priv->timeline_entries == NULL ||
+      priv->timeline_entries->len == 0) {
+    return;
+  }
+
+  if (plugin->preset_path == NULL) {
+    gboolean requires_base = FALSE;
+    for (guint i = 0; i < priv->timeline_entries->len; i++) {
+      GstProjectMTimelineEntry *entry =
+          g_ptr_array_index(priv->timeline_entries, i);
+      if (entry->preset != NULL && !g_path_is_absolute(entry->preset)) {
+        requires_base = TRUE;
+        break;
+      }
+    }
+
+    if (requires_base) {
+      GST_WARNING_OBJECT(
+          plugin,
+          "Timeline contains relative preset paths but preset-path is unset; "
+          "disabling timeline-driven switching");
+      gst_projectm_timeline_reset(plugin);
+      return;
+    }
+  }
+
+  if (priv->handle != NULL) {
+    projectm_set_preset_locked(priv->handle, TRUE);
+    projectm_set_preset_duration(priv->handle, 999999.0);
+  }
+
+  priv->current_timeline_index = -1;
+  priv->timeline_initialized = TRUE;
+
+  GST_DEBUG_OBJECT(plugin, "Timeline activated");
+
+  gst_projectm_timeline_update(plugin, 0.0);
+}
+
+static void gst_projectm_timeline_update(GstProjectM *plugin,
+                                         gdouble elapsed_seconds) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!priv->timeline_active || priv->timeline_entries == NULL ||
+      priv->timeline_entries->len == 0 || priv->handle == NULL) {
+    return;
+  }
+
+  gint target_index = -1;
+
+  for (guint i = 0; i < priv->timeline_entries->len; i++) {
+    GstProjectMTimelineEntry *entry =
+        g_ptr_array_index(priv->timeline_entries, i);
+
+    if ((elapsed_seconds + 1e-6) < entry->start_time) {
+      break;
+    }
+
+    target_index = (gint)i;
+
+    if (elapsed_seconds < entry->end_time + 1e-6) {
+      break;
+    }
+  }
+
+  if (target_index < 0 ||
+      target_index == priv->current_timeline_index ||
+      target_index >= (gint)priv->timeline_entries->len) {
+    return;
+  }
+
+  GstProjectMTimelineEntry *entry =
+      g_ptr_array_index(priv->timeline_entries, (guint)target_index);
+  gchar *resolved = gst_projectm_resolve_preset_path(plugin, entry->preset);
+
+  if (resolved == NULL) {
+    GST_WARNING_OBJECT(plugin,
+                       "Unable to resolve preset path for timeline segment %d",
+                       target_index);
+    priv->current_timeline_index = target_index;
+    return;
+  }
+
+  gboolean smooth_transition = TRUE;
+  if (entry->complexity != NULL) {
+    if (g_ascii_strcasecmp(entry->complexity, "high") == 0 ||
+        g_ascii_strcasecmp(entry->complexity, "intense") == 0) {
+      smooth_transition = FALSE;
+    } else if (g_ascii_strcasecmp(entry->complexity, "ambient") == 0 ||
+               g_ascii_strcasecmp(entry->complexity, "low") == 0) {
+      smooth_transition = TRUE;
+    }
+  }
+
+  GST_INFO_OBJECT(plugin,
+                  "Timeline switch -> preset=%s index=%d start=%.2f duration=%.2f "
+                  "smooth=%d",
+                  resolved, target_index, entry->start_time, entry->duration,
+                  smooth_transition);
+
+  projectm_load_preset_file(priv->handle, resolved, smooth_transition);
+  g_free(resolved);
+
+  priv->current_timeline_index = target_index;
+}
+
+gboolean gst_projectm_timeline_is_active(GstProjectM *plugin) {
+  if (plugin == NULL) {
+    return FALSE;
+  }
+
+  GstProjectMPrivate *priv = plugin->priv;
+  return priv->timeline_active && priv->timeline_entries != NULL &&
+         priv->timeline_entries->len > 0;
+}
 
 void gst_projectm_set_property(GObject *object, guint property_id,
                                const GValue *value, GParamSpec *pspec) {
@@ -95,6 +434,34 @@ void gst_projectm_set_property(GObject *object, guint property_id,
   case PROP_PRESET_LOCKED:
     plugin->preset_locked = g_value_get_boolean(value);
     break;
+  case PROP_TIMELINE_PATH: {
+    gchar *new_path = g_value_dup_string(value);
+
+    if (new_path && *new_path == '\0') {
+      g_free(new_path);
+      new_path = NULL;
+    }
+
+    g_free(plugin->timeline_path);
+    plugin->timeline_path = new_path;
+
+    if (gst_projectm_load_timeline(plugin, plugin->timeline_path)) {
+      if (plugin->priv->handle != NULL) {
+        gst_projectm_activate_timeline(plugin);
+      }
+      GST_INFO_OBJECT(plugin, "Loaded timeline from %s with %u segments",
+                      plugin->timeline_path,
+                      plugin->priv->timeline_entries
+                          ? plugin->priv->timeline_entries->len
+                          : 0);
+    } else if (plugin->timeline_path != NULL) {
+      GST_WARNING_OBJECT(plugin,
+                         "Failed to load timeline from %s, falling back to "
+                         "internal preset selection",
+                         plugin->timeline_path);
+    }
+    break;
+  }
   case PROP_ENABLE_PLAYLIST:
     plugin->enable_playlist = g_value_get_boolean(value);
     break;
@@ -155,6 +522,9 @@ void gst_projectm_get_property(GObject *object, guint property_id,
   case PROP_PRESET_LOCKED:
     g_value_set_boolean(value, plugin->preset_locked);
     break;
+  case PROP_TIMELINE_PATH:
+    g_value_set_string(value, plugin->timeline_path);
+    break;
   case PROP_ENABLE_PLAYLIST:
     g_value_set_boolean(value, plugin->enable_playlist);
     break;
@@ -170,9 +540,18 @@ void gst_projectm_get_property(GObject *object, guint property_id,
 static void gst_projectm_init(GstProjectM *plugin) {
   plugin->priv = gst_projectm_get_instance_private(plugin);
 
+  plugin->priv->timeline_entries =
+      g_ptr_array_new_with_free_func(gst_projectm_timeline_entry_free);
+  plugin->priv->current_timeline_index = -1;
+  plugin->priv->timeline_active = FALSE;
+  plugin->priv->timeline_initialized = FALSE;
+  plugin->priv->first_frame_received = FALSE;
+  plugin->priv->first_frame_time = GST_CLOCK_TIME_NONE;
+
   // Set default values for properties
   plugin->preset_path = DEFAULT_PRESET_PATH;
   plugin->texture_dir_path = DEFAULT_TEXTURE_DIR_PATH;
+  plugin->timeline_path = DEFAULT_TIMELINE_PATH;
   plugin->beat_sensitivity = DEFAULT_BEAT_SENSITIVITY;
   plugin->hard_cut_duration = DEFAULT_HARD_CUT_DURATION;
   plugin->hard_cut_enabled = DEFAULT_HARD_CUT_ENABLED;
@@ -207,6 +586,12 @@ static void gst_projectm_finalize(GObject *object) {
   GstProjectM *plugin = GST_PROJECTM(object);
   g_free(plugin->preset_path);
   g_free(plugin->texture_dir_path);
+  g_free(plugin->timeline_path);
+
+  if (plugin->priv->timeline_entries != NULL) {
+    g_ptr_array_free(plugin->priv->timeline_entries, TRUE);
+    plugin->priv->timeline_entries = NULL;
+  }
   G_OBJECT_CLASS(gst_projectm_parent_class)->finalize(object);
 }
 
@@ -217,6 +602,10 @@ static void gst_projectm_gl_stop(GstGLBaseAudioVisualizer *src) {
     projectm_destroy(plugin->priv->handle);
     plugin->priv->handle = NULL;
   }
+  plugin->priv->current_timeline_index = -1;
+  plugin->priv->timeline_initialized = FALSE;
+  plugin->priv->first_frame_received = FALSE;
+  plugin->priv->first_frame_time = GST_CLOCK_TIME_NONE;
 }
 
 static gboolean gst_projectm_gl_start(GstGLBaseAudioVisualizer *glav) {
@@ -241,6 +630,13 @@ static gboolean gst_projectm_gl_start(GstGLBaseAudioVisualizer *glav) {
       return FALSE;
     }
     gl_error_handler(glav->context, plugin);
+
+    plugin->priv->current_timeline_index = -1;
+    plugin->priv->timeline_initialized = FALSE;
+    plugin->priv->first_frame_received = FALSE;
+    plugin->priv->first_frame_time = GST_CLOCK_TIME_NONE;
+
+    gst_projectm_activate_timeline(plugin);
   }
 
   return TRUE;
@@ -328,6 +724,8 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
       get_seconds_since_first_frame(plugin, video);
   projectm_set_frame_time(plugin->priv->handle, seconds_since_first_frame);
 
+  gst_projectm_timeline_update(plugin, seconds_since_first_frame);
+
   // AUDIO
   gst_buffer_map(audio, &audioMap, GST_MAP_READ);
 
@@ -412,6 +810,14 @@ static void gst_projectm_class_init(GstProjectMClass *klass) {
                           "used in the visualizer.",
                           DEFAULT_TEXTURE_DIR_PATH,
                           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(
+      gobject_class, PROP_TIMELINE_PATH,
+      g_param_spec_string(
+          "timeline-path", "Timeline Path",
+          "Path to a preset timeline definition (.ini) used for deterministic "
+          "preset scheduling.",
+          DEFAULT_TIMELINE_PATH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property(
       gobject_class, PROP_BEAT_SENSITIVITY,

@@ -42,16 +42,18 @@ RUN git clone --depth 1 https://github.com/projectM-visualizer/presets-cream-of-
 # Get the projectM texture pack
 RUN git clone --depth 1 https://github.com/projectM-visualizer/presets-milkdrop-texture-pack.git /usr/local/share/projectM/textures
 
-# Clone the gst-projectm repository and build the GStreamer plugin
-RUN git clone https://github.com/projectM-visualizer/gst-projectm.git /tmp/gst-projectm
+# Copy the local gst-projectm source and build the GStreamer plugin
+COPY . /tmp/gst-projectm
 WORKDIR /tmp/gst-projectm
 RUN ./setup.sh --auto
-RUN mkdir build && \
+RUN rm -rf build && \
+    mkdir build && \
     cd build && \
     cmake -DCMAKE_BUILD_TYPE=Release .. && \
     make
-RUN mkdir -p /usr/lib/x86_64-linux-gnu/gstreamer-1.0/ && \
-    cp build/libgstprojectm.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/ && \
+RUN GST_LIBDIR=$(pkg-config --variable=libdir gstreamer-1.0) && \
+    mkdir -p "$GST_LIBDIR/gstreamer-1.0" && \
+    cp build/libgstprojectm.so "$GST_LIBDIR/gstreamer-1.0/" && \
     rm -rf /tmp/gst-projectm
 
 # Clean up unnecessary packages to reduce image size
