@@ -4,9 +4,9 @@ set -e
 # Default values
 PRESET_PATH="/usr/local/share/projectM/presets"
 TEXTURE_DIR="/usr/local/share/projectM/textures"
-PRESET_DURATION=4
-MESH_X=256
-MESH_Y=144
+PRESET_DURATION=60
+MESH_X=128
+MESH_Y=72
 VIDEO_WIDTH=1920
 VIDEO_HEIGHT=1080
 FRAMERATE=60
@@ -176,14 +176,41 @@ gst-launch-1.0 -e \
             mesh-size=${MESH_X},${MESH_Y} ! \
             identity sync=false ! videoconvert ! videorate ! \
             video/x-raw,framerate=$FRAMERATE/1,width=$VIDEO_WIDTH,height=$VIDEO_HEIGHT ! \
-            x264enc bitrate=$BITRATE key-int-max=200 speed-preset=$SPEED_PRESET ! \
+            x264enc quantizer=42 key-int-max=60 speed-preset=ultrafast threads=1 qp-max=51 ! \
             video/x-h264,stream-format=avc,alignment=au ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
 
 GST_PID=$!
 
-# Wait for the conversion to finish or for signals
+# Wait for the conversion to finish or for signals with timeout
 echo "Conversion running. Press Ctrl+C to stop."
-wait $GST_PID || true
 
-echo "Conversion complete! Output saved to $OUTPUT_FILE"
+# Calculate max duration (audio duration * 4 + 120 seconds buffer)
+MAX_DURATION=7200  # 2 hours max fallback
+
+# Wait with timeout monitoring
+WAIT_COUNT=0
+while kill -0 $GST_PID 2>/dev/null; do
+    sleep 5
+    WAIT_COUNT=$((WAIT_COUNT + 5))
+
+    # Hard timeout
+    if [ $WAIT_COUNT -gt $MAX_DURATION ]; then
+        echo "❌ Conversion timed out after $MAX_DURATION seconds, terminating"
+        kill -TERM $GST_PID 2>/dev/null || true
+        sleep 2
+        kill -KILL $GST_PID 2>/dev/null || true
+        exit 1
+    fi
+done
+
+# Check if conversion completed successfully
+wait $GST_PID
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "Conversion complete! Output saved to $OUTPUT_FILE"
+else
+    echo "❌ Conversion failed with exit code $EXIT_CODE"
+    exit $EXIT_CODE
+fi
