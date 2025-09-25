@@ -1,4 +1,4 @@
-# Start from the official Ubuntu 24.04 image
+# Start from the official Ubuntu 24.04 image hosted on AWS ECR (avoids Docker Hub auth issues)
 FROM public.ecr.aws/lts/ubuntu:24.04
 
 # Install required packages

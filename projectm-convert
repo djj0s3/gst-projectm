@@ -21,8 +21,8 @@ show_help() {
     echo "  -r, --framerate FPS    Output video framerate (default: 60)"
     echo "  -b, --bitrate KBPS     Output video bitrate in kbps (default: 8000)"
     echo "  --speed PRESET         x264 encoding speed preset (default: medium)"
+    echo "  --timeline FILE        Optional preset timeline (INI)"
     echo "  --build                Build/rebuild the Docker image before running (after updating use this)"
-    echo "  --timeline FILE        Path to preset timeline ini (optional)"
     echo "  -h, --help             Display this help message and exit"
     echo ""
     echo "Example:"
@@ -35,7 +35,8 @@ show_help() {
 IMAGE_NAME="gst-projectm-converter"
 BUILD_IMAGE=false
 DOCKER_ARGS=()
-TIMELINE_PATH=""
+TIMELINE_PATH_ABS=""
+TIMELINE_CONTAINER_PATH=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -93,10 +94,13 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --timeline)
-            TIMELINE_PATH="$2"
-            TIMELINE_PATH_ABS=$(realpath "$TIMELINE_PATH")
+            TIMELINE_PATH_ABS=$(realpath "$2")
+            if [ ! -f "$TIMELINE_PATH_ABS" ]; then
+                echo "Error: Timeline file does not exist: $2"
+                exit 1
+            fi
             TIMELINE_FILENAME=$(basename "$TIMELINE_PATH_ABS")
-            DOCKER_ARGS+=("--timeline" "/output/$TIMELINE_FILENAME")
+            TIMELINE_CONTAINER_PATH="/timeline/$TIMELINE_FILENAME"
             shift 2
             ;;
         --build)
@@ -122,11 +126,6 @@ fi
 # Check if input file exists
 if [ ! -f "$INPUT_FILE_ABS" ]; then
     echo "Error: Input file does not exist: $INPUT_FILE"
-    exit 1
-fi
-
-if [ -n "$TIMELINE_PATH" ] && [ ! -f "$TIMELINE_PATH_ABS" ]; then
-    echo "Error: Timeline file does not exist: $TIMELINE_PATH"
     exit 1
 fi
 
@@ -180,6 +179,10 @@ fi
 # Add texture directory if specified
 if [ ! -z "$TEXTURE_DIR" ]; then
     DOCKER_CMD="$DOCKER_CMD -v \"$TEXTURE_DIR_ABS\":/texture"
+fi
+
+if [ ! -z "$TIMELINE_CONTAINER_PATH" ]; then
+    DOCKER_CMD="$DOCKER_CMD -v \"$TIMELINE_PATH_ABS\":$TIMELINE_CONTAINER_PATH:ro -e TIMELINE_FILE=$TIMELINE_CONTAINER_PATH"
 fi
 
 # Finalize and execute the Docker command

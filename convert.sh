@@ -4,6 +4,7 @@ set -e
 # Default values
 PRESET_PATH="/usr/local/share/projectM/presets"
 TEXTURE_DIR="/usr/local/share/projectM/textures"
+TIMELINE_FILE="${TIMELINE_FILE:-}"
 PRESET_DURATION=60
 MESH_X=128
 MESH_Y=72
@@ -54,6 +55,7 @@ show_help() {
     echo "  -r, --framerate FPS    Output video framerate (default: $FRAMERATE)"
     echo "  -b, --bitrate KBPS     Output video bitrate in kbps (default: $BITRATE)"
     echo "  --speed PRESET         x264 encoding speed preset (default: $SPEED_PRESET)"
+    echo "  --timeline FILE        Path to preset timeline (INI)"
     echo "                         Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow"
     echo "  --timeline FILE        Optional preset timeline file (.ini)"
     echo "  -h, --help             Display this help message and exit"
@@ -161,6 +163,14 @@ if [ ! -z "$TIMELINE_FILE" ]; then
     TIMELINE_PROPERTY="timeline-path=$TIMELINE_FILE"
 fi
 
+PROJECTM_ARGS=("preset=$PRESET_PATH" "texture-dir=$TEXTURE_DIR")
+if [ -n "$TIMELINE_PROPERTY" ]; then
+    PROJECTM_ARGS+=("$TIMELINE_PROPERTY")
+else
+    PROJECTM_ARGS+=("preset-duration=$PRESET_DURATION")
+fi
+PROJECTM_ARGS+=("mesh-size=${MESH_X},${MESH_Y}")
+
 # Run the actual conversion
 gst-launch-1.0 -e \
   filesrc location=$INPUT_FILE ! \
@@ -169,11 +179,7 @@ gst-launch-1.0 -e \
             capsfilter caps="audio/x-raw, format=F32LE, channels=2, rate=44100" ! \
             avenc_aac bitrate=320000 ! queue ! mux. \
       t. ! queue ! audioconvert ! projectm \
-            preset=$PRESET_PATH \
-            texture-dir=$TEXTURE_DIR \
-            $TIMELINE_PROPERTY \
-            preset-duration=$PRESET_DURATION \
-            mesh-size=${MESH_X},${MESH_Y} ! \
+            ${PROJECTM_ARGS[@]} ! \
             identity sync=false ! videoconvert ! videorate ! \
             video/x-raw,framerate=$FRAMERATE/1,width=$VIDEO_WIDTH,height=$VIDEO_HEIGHT ! \
             x264enc quantizer=42 key-int-max=60 speed-preset=ultrafast threads=1 qp-max=51 ! \
