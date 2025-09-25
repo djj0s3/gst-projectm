@@ -1,5 +1,5 @@
 # Start from the official Ubuntu 24.04 image
-FROM ubuntu:24.04
+FROM public.ecr.aws/lts/ubuntu:24.04
 
 # Install required packages
 RUN apt-get update && \
