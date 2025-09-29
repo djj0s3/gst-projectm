@@ -13,8 +13,6 @@ VIDEO_HEIGHT=1080
 FRAMERATE=60
 BITRATE=8000
 SPEED_PRESET="medium"
-VBV_BUF_CAPACITY=1000
-TIMELINE_FILE=""
 
 # Process ID for the gst-launch process
 GST_PID=""
@@ -183,8 +181,7 @@ gst-launch-1.0 -e \
             ${PROJECTM_ARGS[@]} ! \
             identity sync=false ! videoconvert ! videorate ! \
             video/x-raw,framerate=$FRAMERATE/1,width=$VIDEO_WIDTH,height=$VIDEO_HEIGHT ! \
-            x264enc bitrate=$BITRATE vbv-buf-capacity=$VBV_BUF_CAPACITY \
-                    tune=zerolatency speed-preset=$SPEED_PRESET key-int-max=$((FRAMERATE * 2)) threads=2 ! \
+            x264enc bitrate=$BITRATE tune=zerolatency speed-preset=$SPEED_PRESET key-int-max=$((FRAMERATE * 2)) threads=2 ! \
             video/x-h264,stream-format=avc,alignment=au ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
 
