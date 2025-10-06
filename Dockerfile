@@ -1,9 +1,12 @@
-# Start from the official Ubuntu 24.04 image hosted on AWS ECR (avoids Docker Hub auth issues)
-FROM public.ecr.aws/lts/ubuntu:24.04
+# Start from the official Ubuntu 24.04 image
+FROM ubuntu:24.04
 
 # Install required packages
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
+    echo 'Acquire::AllowInsecureRepositories "true";' > /etc/apt/apt.conf.d/99allow-insecure && \
+    echo 'Acquire::AllowDowngradeToInsecureRepositories "true";' >> /etc/apt/apt.conf.d/99allow-insecure && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-unauthenticated \
         build-essential \
         llvm \
         git \
@@ -22,6 +25,9 @@ RUN apt-get update && \
         gstreamer1.0-tools \
         libgles2-mesa-dev \
         mesa-utils \
+        python3 \
+        python3-pip \
+        python3-venv \
         sudo
 
 # Clone the projectM repository and build it
@@ -36,11 +42,15 @@ RUN make install
 WORKDIR /tmp
 RUN rm -rf /tmp/projectm
 
-# Get the projectM preset pack
-RUN git clone --depth 1 https://github.com/projectM-visualizer/presets-cream-of-the-crop.git /usr/local/share/projectM/presets
+# Copy preset and texture packs from build context
+COPY presets /usr/local/share/projectM/presets
+COPY textures /usr/local/share/projectM/textures
 
-# Get the projectM texture pack
-RUN git clone --depth 1 https://github.com/projectM-visualizer/presets-milkdrop-texture-pack.git /usr/local/share/projectM/textures
+# Install Python dependencies for RunPod serverless handler support (PEP 668 compliant)
+RUN python3 -m venv /opt/runpod-env
+ENV VIRTUAL_ENV=/opt/runpod-env
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN pip install --no-cache-dir runpod requests fastapi uvicorn
 
 # Copy the local gst-projectm source and build the GStreamer plugin
 COPY . /tmp/gst-projectm
@@ -71,6 +81,12 @@ WORKDIR /app
 COPY convert.sh /app/
 RUN chmod +x /app/convert.sh
 
+# Copy RunPod serverless handler stub (used when deploying as a serverless endpoint)
+COPY runpod_handler.py /app/runpod_handler.py
+COPY runpod_pod_server.py /app/runpod_pod_server.py
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
 # Set environment variables
 ENV GST_DEBUG=3
 ENV PRESETS_DIR=/usr/local/share/projectM/presets
@@ -87,5 +103,5 @@ ENV MESA_GL_VERSION_OVERRIDE=3.3
 ENV MESA_GLSL_VERSION_OVERRIDE=330
 ENV GST_GL_SHADER_DEBUG=0
 
-# Default command
-ENTRYPOINT ["/app/convert.sh"]
+# Default entrypoint dispatches between conversion and server modes
+ENTRYPOINT ["/app/start.sh"]
