@@ -13,9 +13,102 @@ VIDEO_HEIGHT=1080
 FRAMERATE=60
 BITRATE=8000
 SPEED_PRESET="medium"
+ENCODER="auto"
+FORCE_GPU=0
+FORCE_XVFB=0
+MESH_CUSTOM=0
 
-# Process ID for the gst-launch process
+# Process IDs for the gst-launch process and Xvfb
 GST_PID=""
+XVFB_PID=""
+
+has_gpu() {
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        return 0
+    fi
+
+    for dev in /dev/dri/renderD* /dev/dri/card* /dev/nvidia0; do
+        if [ -e "$dev" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+start_xvfb() {
+    echo "Starting Xvfb (software rendering fallback)..."
+    Xvfb :99 -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 &
+    XVFB_PID=$!
+    export DISPLAY=:99
+}
+
+use_headless_gpu() {
+    echo "Using EGL headless GPU rendering (DISPLAY unset)."
+    unset DISPLAY
+    export GST_GL_PLATFORM=${GST_GL_PLATFORM:-egl}
+    export GST_GL_WINDOW=${GST_GL_WINDOW:-none}
+    export GST_GL_API=${GST_GL_API:-opengl}
+    export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
+}
+
+set_auto_mesh() {
+    local width=$1
+    local height=$2
+
+    local auto_x=$((width / 16))
+    local auto_y=$((height / 16))
+
+    if [ $auto_x -lt 64 ]; then
+        auto_x=64
+    fi
+    if [ $auto_y -lt 36 ]; then
+        auto_y=36
+    fi
+
+    if [ $auto_x -gt 192 ]; then
+        auto_x=192
+    fi
+    if [ $auto_y -gt 108 ]; then
+        auto_y=108
+    fi
+
+    MESH_X=$auto_x
+    MESH_Y=$auto_y
+}
+
+gst_plugin_available() {
+    local plugin="$1"
+    if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+        return 1
+    fi
+    gst-inspect-1.0 "$plugin" >/dev/null 2>&1
+}
+
+select_best_encoder() {
+    if [ "$ENCODER" != "auto" ]; then
+        return
+    fi
+
+    if [ "$use_gpu" -eq 1 ]; then
+        if command -v nvidia-smi >/dev/null 2>&1 && gst_plugin_available nvh264enc; then
+            ENCODER="nvh264"
+            return
+        fi
+
+        if gst_plugin_available vaapih264enc; then
+            ENCODER="vaapih264"
+            return
+        fi
+
+        if gst_plugin_available msdkh264enc; then
+            ENCODER="qsvh264"
+            return
+        fi
+    fi
+
+    ENCODER="x264"
+}
 
 # Signal handler for proper termination
 cleanup() {
@@ -28,8 +121,10 @@ cleanup() {
         kill -TERM $GST_PID 2>/dev/null || true
     fi
 
-    # Kill Xvfb if running
-    pkill Xvfb || true
+    if [ ! -z "$XVFB_PID" ]; then
+        kill -TERM $XVFB_PID 2>/dev/null || true
+        wait $XVFB_PID 2>/dev/null || true
+    fi
 
     exit 0
 }
@@ -53,8 +148,11 @@ show_help() {
     echo "  --video-size WxH       Output video size (default: ${VIDEO_WIDTH}x${VIDEO_HEIGHT})"
     echo "  -r, --framerate FPS    Output video framerate (default: $FRAMERATE)"
     echo "  -b, --bitrate KBPS     Output video bitrate in kbps (default: $BITRATE)"
-    echo "  --speed PRESET         x264 encoding speed preset (default: $SPEED_PRESET)"
+    echo "  --speed PRESET         x264 encoding speed preset (default: $SPEED_PRESET, only used with --encoder x264)"
     echo "  --timeline FILE        Path to preset timeline (INI)"
+    echo "  --encoder NAME         Encoder: auto (default), x264, nvh264, vaapih264, qsvh264"
+    echo "  --force-gpu            Force EGL/DRI headless GPU usage (fail if unavailable)"
+    echo "  --force-xvfb           Force legacy software rendering via Xvfb"
     echo "                         Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow"
     echo "  --timeline FILE        Optional preset timeline file (.ini)"
     echo "  -h, --help             Display this help message and exit"
@@ -93,6 +191,7 @@ while [[ $# -gt 0 ]]; do
             MESH_SIZE="$2"
             MESH_X=$(echo $MESH_SIZE | cut -d'x' -f1)
             MESH_Y=$(echo $MESH_SIZE | cut -d'x' -f2)
+            MESH_CUSTOM=1
             shift 2
             ;;
         --video-size)
@@ -117,6 +216,18 @@ while [[ $# -gt 0 ]]; do
             TIMELINE_FILE="$2"
             shift 2
             ;;
+        --encoder)
+            ENCODER="$2"
+            shift 2
+            ;;
+        --force-gpu)
+            FORCE_GPU=1
+            shift
+            ;;
+        --force-xvfb)
+            FORCE_XVFB=1
+            shift
+            ;;
         -h|--help)
             show_help
             ;;
@@ -133,29 +244,76 @@ if [ -z "$INPUT_FILE" ] || [ -z "$OUTPUT_FILE" ]; then
     show_help
 fi
 
-# If running in Docker, use the environment
-if [ -z "$INSIDE_DOCKER" ]; then
-    # Display conversion parameters
-    echo "Starting Xvfb..."
-    Xvfb :99 -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 &
-    export DISPLAY=:99
-    export INSIDE_DOCKER=1
+if [ $MESH_CUSTOM -eq 0 ]; then
+    set_auto_mesh "$VIDEO_WIDTH" "$VIDEO_HEIGHT"
+fi
 
-    echo "Converting $INPUT_FILE to $OUTPUT_FILE"
-    echo "Preset path: $PRESET_PATH"
-    echo "Preset duration: $PRESET_DURATION seconds"
-    echo "Mesh size: ${MESH_X}x${MESH_Y}"
-    echo "Video size: ${VIDEO_WIDTH}x${VIDEO_HEIGHT}"
-    echo "Framerate: $FRAMERATE fps"
-    echo "Bitrate: $BITRATE kbps"
-    echo "Encoding speed: $SPEED_PRESET"
-    if [ ! -z "$TIMELINE_FILE" ]; then
-        echo "Timeline: $TIMELINE_FILE"
+ENCODER=$(echo "$ENCODER" | tr '[:upper:]' '[:lower:]')
+
+if [ "$FORCE_XVFB" -eq 1 ] && [ "$FORCE_GPU" -eq 1 ]; then
+    echo "Error: --force-gpu and --force-xvfb cannot be used together"
+    exit 1
+fi
+
+# Decide rendering backend
+if [ "$FORCE_XVFB" -eq 1 ]; then
+    use_gpu=0
+    start_xvfb
+elif [ "$FORCE_GPU" -eq 1 ]; then
+    if has_gpu; then
+        use_gpu=1
+        use_headless_gpu
+    else
+        echo "Error: --force-gpu requested but no GPU devices were detected"
+        exit 1
+    fi
+else
+    if has_gpu; then
+        use_gpu=1
+        use_headless_gpu
+    else
+        echo "No GPU detected; falling back to software rendering via Xvfb"
+        use_gpu=0
+        start_xvfb
     fi
 fi
 
-# Wait a moment for Xvfb to start
-sleep 1
+select_best_encoder
+
+if [ -z "$INSIDE_DOCKER" ]; then
+    export INSIDE_DOCKER=1
+fi
+
+echo "Converting $INPUT_FILE to $OUTPUT_FILE"
+echo "Preset path: $PRESET_PATH"
+echo "Preset duration: $PRESET_DURATION seconds"
+if [ $MESH_CUSTOM -eq 0 ]; then
+    echo "Mesh size: ${MESH_X}x${MESH_Y} (auto)"
+else
+    echo "Mesh size: ${MESH_X}x${MESH_Y}"
+fi
+echo "Video size: ${VIDEO_WIDTH}x${VIDEO_HEIGHT}"
+echo "Framerate: $FRAMERATE fps"
+echo "Bitrate: $BITRATE kbps"
+echo "Encoder: $ENCODER"
+if [ "$ENCODER" = "x264" ]; then
+    echo "x264 speed preset: $SPEED_PRESET"
+else
+    echo "Encoder preset flag ignored (handled internally by $ENCODER)"
+fi
+if [ "$use_gpu" -eq 1 ]; then
+    echo "Rendering Mode: Headless EGL (GPU)"
+else
+    echo "Rendering Mode: Xvfb software fallback"
+fi
+if [ ! -z "$TIMELINE_FILE" ]; then
+    echo "Timeline: $TIMELINE_FILE"
+fi
+
+if [ "$use_gpu" -eq 0 ]; then
+    # Wait a moment for Xvfb to start
+    sleep 1
+fi
 
 TIMELINE_PROPERTY=""
 if [ ! -z "$TIMELINE_FILE" ]; then
@@ -170,18 +328,41 @@ else
 fi
 PROJECTM_ARGS+=("mesh-size=${MESH_X},${MESH_Y}")
 
+KEY_INT=$((FRAMERATE * 2))
+case "$ENCODER" in
+    x264)
+        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! x264enc bitrate=$BITRATE speed-preset=$SPEED_PRESET key-int-max=$KEY_INT threads=0"
+        ;;
+    nvh264)
+        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! nvh264enc bitrate=$BITRATE preset=hp rc-mode=cbr-hq gop-size=$KEY_INT iframeinterval=$KEY_INT"
+        ;;
+    vaapih264)
+        VAAPI_BITRATE=$BITRATE
+        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! vaapih264enc bitrate=$VAAPI_BITRATE keyframe-period=$KEY_INT"
+        ;;
+    qsvh264)
+        QSV_BITRATE=$BITRATE
+        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! msdkh264enc bitrate=$QSV_BITRATE rate-control=cbr gop-size=$KEY_INT"
+        ;;
+    *)
+        echo "Unsupported encoder '$ENCODER'. Supported encoders: x264, nvh264, vaapih264, qsvh264"
+        exit 1
+        ;;
+esac
+
+AUDIO_QUEUE_OPTS="queue max-size-buffers=2048 max-size-bytes=0 max-size-time=0"
+VIDEO_QUEUE_OPTS="queue max-size-buffers=12 max-size-bytes=0 max-size-time=0 leaky=downstream"
+
 # Run the actual conversion
 gst-launch-1.0 -e \
   filesrc location=$INPUT_FILE ! \
     decodebin ! tee name=t \
-      t. ! queue ! audioconvert ! audioresample ! \
+      t. ! $AUDIO_QUEUE_OPTS ! audioconvert ! audioresample ! \
             capsfilter caps="audio/x-raw, format=F32LE, channels=2, rate=44100" ! \
             avenc_aac bitrate=320000 ! queue ! mux. \
-      t. ! queue ! audioconvert ! projectm \
+      t. ! $VIDEO_QUEUE_OPTS ! audioconvert ! projectm \
             ${PROJECTM_ARGS[@]} ! \
-            identity sync=false ! videoconvert ! videorate ! \
-            video/x-raw,framerate=$FRAMERATE/1,width=$VIDEO_WIDTH,height=$VIDEO_HEIGHT ! \
-            x264enc bitrate=$BITRATE tune=zerolatency speed-preset=$SPEED_PRESET key-int-max=$((FRAMERATE * 2)) threads=2 ! \
+            ${ENCODER_PIPELINE} ! \
             video/x-h264,stream-format=avc,alignment=au ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
 

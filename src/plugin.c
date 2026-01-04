@@ -13,6 +13,15 @@
 
 #include <projectM-4/projectM.h>
 
+#include <string.h>
+
+#ifndef GL_MAP_READ_BIT
+#define GL_MAP_READ_BIT 0x0001
+#endif
+
+#define GST_PROJECTM_TIMELINE_EPSILON (1e-6)
+#define GST_PROJECTM_PBO_COUNT 3
+
 #include "caps.h"
 #include "config.h"
 #include "debug.h"
@@ -41,6 +50,19 @@ static void gst_projectm_timeline_update(GstProjectM *plugin,
                                          gdouble elapsed_seconds);
 static gchar *gst_projectm_resolve_preset_path(GstProjectM *plugin,
                                                const gchar *preset_value);
+static gint gst_projectm_timeline_find_target_index(GstProjectM *plugin,
+                                                    gdouble elapsed_seconds);
+
+static gboolean gst_projectm_ensure_pbos(GstProjectM *plugin,
+                                         const GstGLFuncs *glFunctions,
+                                         gsize width, gsize height);
+static void gst_projectm_release_pbos(GstProjectM *plugin,
+                                      const GstGLFuncs *glFunctions);
+static gboolean gst_projectm_download_frame_with_pbo(
+    GstProjectM *plugin, const GstGLFuncs *glFunctions, GstVideoFrame *video,
+    gsize width, gsize height);
+static void gst_projectm_copy_to_frame(GstVideoFrame *video, const guint8 *src,
+                                       gsize width, gsize height);
 
 struct _GstProjectMPrivate {
   GLenum gl_format;
@@ -53,6 +75,14 @@ struct _GstProjectMPrivate {
   gint current_timeline_index;
   gboolean timeline_active;
   gboolean timeline_initialized;
+
+  GLuint pbo_ids[GST_PROJECTM_PBO_COUNT];
+  gsize pbo_size;
+  gsize pbo_width;
+  gsize pbo_height;
+  guint pbo_index;
+  gboolean pbo_initialized;
+  gboolean pbo_frame_valid;
 };
 
 G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
@@ -126,6 +156,68 @@ static gchar *gst_projectm_resolve_preset_path(GstProjectM *plugin,
   }
 
   return g_strdup(preset_value);
+}
+
+static gint gst_projectm_timeline_find_target_index(GstProjectM *plugin,
+                                                    gdouble elapsed_seconds) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!priv->timeline_entries || priv->timeline_entries->len == 0) {
+    return -1;
+  }
+
+  gint len = (gint)priv->timeline_entries->len;
+  gint current = priv->current_timeline_index;
+
+  if (current >= 0 && current < len) {
+    GstProjectMTimelineEntry *entry =
+        g_ptr_array_index(priv->timeline_entries, (guint)current);
+
+    if ((elapsed_seconds + GST_PROJECTM_TIMELINE_EPSILON) <
+        entry->start_time) {
+      current = -1;
+    } else {
+      gboolean before_next = TRUE;
+      if (current + 1 < len) {
+        GstProjectMTimelineEntry *next_entry =
+            g_ptr_array_index(priv->timeline_entries, (guint)(current + 1));
+        before_next =
+            (elapsed_seconds + GST_PROJECTM_TIMELINE_EPSILON) <
+            next_entry->start_time;
+      }
+
+      if ((elapsed_seconds <= entry->end_time + GST_PROJECTM_TIMELINE_EPSILON) ||
+          before_next || current == len - 1) {
+        return current;
+      }
+    }
+  }
+
+  gint low = 0;
+  gint high = len - 1;
+  gint result = -1;
+
+  while (low <= high) {
+    gint mid = low + ((high - low) / 2);
+    GstProjectMTimelineEntry *entry =
+        g_ptr_array_index(priv->timeline_entries, (guint)mid);
+
+    if ((elapsed_seconds + GST_PROJECTM_TIMELINE_EPSILON) <
+        entry->start_time) {
+      high = mid - 1;
+      continue;
+    }
+
+    result = mid;
+
+    if (elapsed_seconds <= entry->end_time + GST_PROJECTM_TIMELINE_EPSILON) {
+      break;
+    }
+
+    low = mid + 1;
+  }
+
+  return result;
 }
 
 static gboolean gst_projectm_load_timeline(GstProjectM *plugin,
@@ -309,22 +401,8 @@ static void gst_projectm_timeline_update(GstProjectM *plugin,
     return;
   }
 
-  gint target_index = -1;
-
-  for (guint i = 0; i < priv->timeline_entries->len; i++) {
-    GstProjectMTimelineEntry *entry =
-        g_ptr_array_index(priv->timeline_entries, i);
-
-    if ((elapsed_seconds + 1e-6) < entry->start_time) {
-      break;
-    }
-
-    target_index = (gint)i;
-
-    if (elapsed_seconds < entry->end_time + 1e-6) {
-      break;
-    }
-  }
+  gint target_index =
+      gst_projectm_timeline_find_target_index(plugin, elapsed_seconds);
 
   if (target_index < 0 ||
       target_index == priv->current_timeline_index ||
@@ -367,6 +445,147 @@ static void gst_projectm_timeline_update(GstProjectM *plugin,
   priv->current_timeline_index = target_index;
 }
 
+static void gst_projectm_copy_to_frame(GstVideoFrame *video, const guint8 *src,
+                                       gsize width, gsize height) {
+  guint8 *dest = (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 0);
+  gsize dest_stride = GST_VIDEO_FRAME_PLANE_STRIDE(video, 0);
+  gsize row_size = width * 4;
+
+  if (dest_stride == row_size) {
+    memcpy(dest, src, row_size * height);
+    return;
+  }
+
+  for (gsize y = 0; y < height; y++) {
+    memcpy(dest + (y * dest_stride), src + (y * row_size), row_size);
+  }
+}
+
+static gpointer gst_projectm_map_pbo(const GstGLFuncs *glFunctions, gsize size) {
+  if (glFunctions->MapBufferRange) {
+    return glFunctions->MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, size,
+                                       GL_MAP_READ_BIT);
+  }
+
+  if (glFunctions->MapBuffer) {
+    return glFunctions->MapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+  }
+
+  return NULL;
+}
+
+static void gst_projectm_unmap_pbo(const GstGLFuncs *glFunctions) {
+  if (glFunctions->UnmapBuffer) {
+    glFunctions->UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+  }
+}
+
+static gboolean gst_projectm_ensure_pbos(GstProjectM *plugin,
+                                         const GstGLFuncs *glFunctions,
+                                         gsize width, gsize height) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!glFunctions || !glFunctions->GenBuffers || !glFunctions->BindBuffer ||
+      !glFunctions->BufferData) {
+    return FALSE;
+  }
+
+  gsize row_size = width * 4;
+  gsize required_size = row_size * height;
+
+  if (priv->pbo_initialized && priv->pbo_size == required_size &&
+      priv->pbo_width == width && priv->pbo_height == height) {
+    return TRUE;
+  }
+
+  gst_projectm_release_pbos(plugin, glFunctions);
+
+  glFunctions->GenBuffers(GST_PROJECTM_PBO_COUNT, priv->pbo_ids);
+  for (guint i = 0; i < GST_PROJECTM_PBO_COUNT; i++) {
+    glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, priv->pbo_ids[i]);
+    glFunctions->BufferData(GL_PIXEL_PACK_BUFFER, required_size, NULL,
+                            GL_STREAM_READ);
+  }
+  glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+  priv->pbo_initialized = TRUE;
+  priv->pbo_width = width;
+  priv->pbo_height = height;
+  priv->pbo_size = required_size;
+  priv->pbo_index = 0;
+  priv->pbo_frame_valid = FALSE;
+
+  return TRUE;
+}
+
+static void gst_projectm_release_pbos(GstProjectM *plugin,
+                                      const GstGLFuncs *glFunctions) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!priv->pbo_initialized) {
+    return;
+  }
+
+  if (glFunctions && glFunctions->DeleteBuffers) {
+    glFunctions->DeleteBuffers(GST_PROJECTM_PBO_COUNT, priv->pbo_ids);
+  }
+
+  memset(priv->pbo_ids, 0, sizeof(priv->pbo_ids));
+  priv->pbo_initialized = FALSE;
+  priv->pbo_size = 0;
+  priv->pbo_width = 0;
+  priv->pbo_height = 0;
+  priv->pbo_index = 0;
+  priv->pbo_frame_valid = FALSE;
+}
+
+static gboolean gst_projectm_download_frame_with_pbo(
+    GstProjectM *plugin, const GstGLFuncs *glFunctions, GstVideoFrame *video,
+    gsize width, gsize height) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!priv->pbo_initialized || !glFunctions || !glFunctions->BindBuffer) {
+    return FALSE;
+  }
+
+  guint next_index = (priv->pbo_index + 1) % GST_PROJECTM_PBO_COUNT;
+  GLuint next_pbo = priv->pbo_ids[next_index];
+
+  glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, next_pbo);
+  glFunctions->ReadPixels(0, 0, width, height, priv->gl_format,
+                          GL_UNSIGNED_INT_8_8_8_8, 0);
+  glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+  gboolean copied = FALSE;
+
+  if (priv->pbo_frame_valid) {
+    GLuint ready_pbo = priv->pbo_ids[priv->pbo_index];
+    glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, ready_pbo);
+    guint8 *mapped = (guint8 *)gst_projectm_map_pbo(glFunctions, priv->pbo_size);
+    if (mapped != NULL) {
+      gst_projectm_copy_to_frame(video, mapped, width, height);
+      copied = TRUE;
+      gst_projectm_unmap_pbo(glFunctions);
+    }
+    glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  }
+
+  priv->pbo_index = next_index;
+  priv->pbo_frame_valid = TRUE;
+
+  if (!copied) {
+    glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, next_pbo);
+    guint8 *mapped = (guint8 *)gst_projectm_map_pbo(glFunctions, priv->pbo_size);
+    if (mapped != NULL) {
+      gst_projectm_copy_to_frame(video, mapped, width, height);
+      copied = TRUE;
+      gst_projectm_unmap_pbo(glFunctions);
+    }
+    glFunctions->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  }
+
+  return copied;
+}
 gboolean gst_projectm_timeline_is_active(GstProjectM *plugin) {
   if (plugin == NULL) {
     return FALSE;
@@ -580,6 +799,13 @@ static void gst_projectm_init(GstProjectM *plugin) {
   plugin->easter_egg = DEFAULT_EASTER_EGG;
   plugin->preset_locked = DEFAULT_PRESET_LOCKED;
   plugin->priv->handle = NULL;
+  memset(plugin->priv->pbo_ids, 0, sizeof(plugin->priv->pbo_ids));
+  plugin->priv->pbo_initialized = FALSE;
+  plugin->priv->pbo_frame_valid = FALSE;
+  plugin->priv->pbo_size = 0;
+  plugin->priv->pbo_width = 0;
+  plugin->priv->pbo_height = 0;
+  plugin->priv->pbo_index = 0;
 }
 
 static void gst_projectm_finalize(GObject *object) {
@@ -597,11 +823,16 @@ static void gst_projectm_finalize(GObject *object) {
 
 static void gst_projectm_gl_stop(GstGLBaseAudioVisualizer *src) {
   GstProjectM *plugin = GST_PROJECTM(src);
+  const GstGLFuncs *glFunctions =
+      src->context ? src->context->gl_vtable : NULL;
+
   if (plugin->priv->handle) {
     GST_DEBUG_OBJECT(plugin, "Destroying ProjectM instance");
     projectm_destroy(plugin->priv->handle);
     plugin->priv->handle = NULL;
   }
+
+  gst_projectm_release_pbos(plugin, glFunctions);
   plugin->priv->current_timeline_index = -1;
   plugin->priv->timeline_initialized = FALSE;
   plugin->priv->first_frame_received = FALSE;
@@ -751,9 +982,18 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
   projectm_opengl_render_frame(plugin->priv->handle);
   gl_error_handler(glav->context, plugin);
 
-  glFunctions->ReadPixels(0, 0, windowWidth, windowHeight,
-                          plugin->priv->gl_format, GL_UNSIGNED_INT_8_8_8_8,
-                          (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 0));
+  gboolean used_async = FALSE;
+  if (gst_projectm_ensure_pbos(plugin, glFunctions, windowWidth,
+                               windowHeight)) {
+    used_async = gst_projectm_download_frame_with_pbo(
+        plugin, glFunctions, video, windowWidth, windowHeight);
+  }
+
+  if (!used_async) {
+    glFunctions->ReadPixels(0, 0, windowWidth, windowHeight,
+                            plugin->priv->gl_format, GL_UNSIGNED_INT_8_8_8_8,
+                            (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 0));
+  }
 
   gst_buffer_unmap(audio, &audioMap);
 
