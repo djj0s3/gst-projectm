@@ -54,6 +54,8 @@ RUN pip install --no-cache-dir runpod requests fastapi uvicorn
 
 # Copy the local gst-projectm source and build the GStreamer plugin
 COPY . /tmp/gst-projectm
+# Trim the git history to avoid bloating the image layer / exhausting disk
+RUN rm -rf /tmp/gst-projectm/.git
 WORKDIR /tmp/gst-projectm
 RUN ./setup.sh --auto
 RUN rm -rf build && \

@@ -4,7 +4,9 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import requests
 import runpod
 
 # Default paths bundled inside the container
@@ -12,6 +14,12 @@ DEFAULT_PRESET_DIR = os.environ.get("RUNPOD_PRESET_DIR", "/usr/local/share/proje
 DEFAULT_TEXTURE_DIR = os.environ.get("RUNPOD_TEXTURE_DIR", "/usr/local/share/projectM/textures")
 DEFAULT_OUTPUT_NAME = os.environ.get("RUNPOD_OUTPUT_NAME", "output.mp4")
 DEFAULT_TIMEOUT_SEC = float(os.environ.get("RUNPOD_CONVERT_TIMEOUT", "10800"))  # 3 hours
+DEFAULT_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+}
 
 
 class ConversionError(Exception):
@@ -24,6 +32,56 @@ def _write_binary_file(target: Path, data_b64: str) -> None:
             file_handle.write(base64.b64decode(data_b64))
     except Exception as exc:  # noqa: BLE001
         raise ConversionError(f"Failed to decode base64 payload to {target.name}: {exc}") from exc
+
+
+def _normalize_storage_url(url: str) -> str:
+    """Coerce known providers (Dropbox/OneDrive) into direct-download URLs."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    if "dropbox.com" in host:
+        # Force direct download
+        query["dl"] = "1"
+        parsed = parsed._replace(netloc="www.dropbox.com", query=urlencode(query))
+    elif "onedrive" in host or "1drv.ms" in host or "sharepoint.com" in host:
+        query["download"] = "1"
+        parsed = parsed._replace(query=urlencode(query))
+
+    return urlunparse(parsed)
+
+
+def _download_from_url(audio_url: str, target: Path) -> None:
+    normalized = _normalize_storage_url(audio_url)
+    try:
+        head_resp = requests.head(
+            normalized,
+            allow_redirects=True,
+            timeout=30,
+            headers=DEFAULT_DOWNLOAD_HEADERS,
+        )
+        head_resp.raise_for_status()
+        content_type = head_resp.headers.get("Content-Type", "")
+        if content_type and not content_type.lower().startswith("audio/"):
+            raise ConversionError("Remote URL did not return an audio file (content-type mismatch)")
+
+        with requests.get(
+            normalized,
+            stream=True,
+            timeout=120,
+            allow_redirects=True,
+            headers=DEFAULT_DOWNLOAD_HEADERS,
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", content_type)
+            if not content_type.lower().startswith("audio/"):
+                raise ConversionError("Remote URL did not return an audio file")
+            with target.open("wb") as out_file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        out_file.write(chunk)
+    except Exception as exc:  # noqa: BLE001
+        raise ConversionError(f"Failed to download audio from URL: {exc}") from exc
 
 
 def _build_command(
@@ -73,8 +131,9 @@ def _build_command(
 def handler(job):
     input_payload = job.get("input") or {}
     audio_b64 = input_payload.get("audio_b64")
-    if not audio_b64:
-        return {"error": "Missing audio_b64 in payload"}
+    audio_url = input_payload.get("audio_url")
+    if not audio_b64 and not audio_url:
+        return {"error": "Missing audio_b64 or audio_url in payload"}
 
     audio_name = input_payload.get("audio_filename") or "input_audio"
     suffix = Path(audio_name).suffix or ".mp3"
@@ -85,7 +144,10 @@ def handler(job):
     with tempfile.TemporaryDirectory(prefix="runpod_projectm_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         audio_path = tmp_path / f"audio{suffix}"
-        _write_binary_file(audio_path, audio_b64)
+        if audio_b64:
+            _write_binary_file(audio_path, audio_b64)
+        elif audio_url:
+            _download_from_url(audio_url, audio_path)
 
         timeline_path = None
         if timeline_ini:
