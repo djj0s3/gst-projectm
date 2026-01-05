@@ -87,6 +87,16 @@ def _extract_direct_audio_url(html_text: str) -> str | None:
             pass
         return decoded
 
+    def _maybe_build_drive_confirm_url() -> str | None:
+        confirm_match = re.search(r'name=["\']confirm["\']\s+value=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+        id_match = re.search(r'name=["\']id["\']\s+value=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+        if not (confirm_match and id_match):
+            return None
+        confirm_token = _clean(confirm_match.group(1))
+        file_id = _clean(id_match.group(1))
+        query = urlencode({"export": "download", "confirm": confirm_token, "id": file_id})
+        return f"https://drive.google.com/uc?{query}"
+
     patterns = [
         re.compile(r'window\.location(?:\.replace|\.href)?\s*\(\s*[\'"]([^\'"]+)[\'"]', re.IGNORECASE),
         re.compile(r'content\s*=\s*"\d+;\s*url=([^"]+)"', re.IGNORECASE),
@@ -105,6 +115,10 @@ def _extract_direct_audio_url(html_text: str) -> str | None:
         match = pattern.search(html_text)
         if match:
             return _clean(match.group(1))
+
+    drive_confirm = _maybe_build_drive_confirm_url()
+    if drive_confirm:
+        return drive_confirm
 
     candidates = re.findall(r'https?://[^\s"\']+', html_text)
     for candidate in candidates:
@@ -200,72 +214,78 @@ def _build_command(
 
 
 def handler(job):
-    input_payload = job.get("input") or {}
-    audio_b64 = input_payload.get("audio_b64")
-    audio_url = input_payload.get("audio_url")
-    if not audio_b64 and not audio_url:
-        return {"error": "Missing audio_b64 or audio_url in payload"}
+    try:
+        input_payload = job.get("input") or {}
+        audio_b64 = input_payload.get("audio_b64")
+        audio_url = input_payload.get("audio_url")
+        if not audio_b64 and not audio_url:
+            return {"error": "Missing audio_b64 or audio_url in payload"}
 
-    audio_name = input_payload.get("audio_filename") or "input_audio"
-    suffix = Path(audio_name).suffix or ".mp3"
+        audio_name = input_payload.get("audio_filename") or "input_audio"
+        suffix = Path(audio_name).suffix or ".mp3"
 
-    timeline_ini = input_payload.get("timeline_ini")
-    timeout_override = float(input_payload.get("timeout_sec") or DEFAULT_TIMEOUT_SEC)
+        timeline_ini = input_payload.get("timeline_ini")
+        timeout_override = float(input_payload.get("timeout_sec") or DEFAULT_TIMEOUT_SEC)
 
-    with tempfile.TemporaryDirectory(prefix="runpod_projectm_") as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        audio_path = tmp_path / f"audio{suffix}"
-        if audio_b64:
-            _write_binary_file(audio_path, audio_b64)
-        elif audio_url:
-            _download_from_url(audio_url, audio_path)
+        with tempfile.TemporaryDirectory(prefix="runpod_projectm_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            audio_path = tmp_path / f"audio{suffix}"
+            if audio_b64:
+                _write_binary_file(audio_path, audio_b64)
+            elif audio_url:
+                try:
+                    _download_from_url(audio_url, audio_path)
+                except ConversionError as exc:
+                    return {"error": f"Remote download failed: {exc}"}
 
-        timeline_path = None
-        if timeline_ini:
-            timeline_path = tmp_path / "timeline.ini"
-            timeline_path.write_text(timeline_ini, encoding="utf-8")
+            timeline_path = None
+            if timeline_ini:
+                timeline_path = tmp_path / "timeline.ini"
+                timeline_path.write_text(timeline_ini, encoding="utf-8")
 
-        output_path = tmp_path / DEFAULT_OUTPUT_NAME
+            output_path = tmp_path / DEFAULT_OUTPUT_NAME
 
-        cmd = _build_command(audio_path, output_path, timeline_path, input_payload)
+            cmd = _build_command(audio_path, output_path, timeline_path, input_payload)
 
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=timeout_override,
-            )
-        except subprocess.TimeoutExpired as timeout_exc:  # noqa: PERF203
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=timeout_override,
+                )
+            except subprocess.TimeoutExpired as timeout_exc:  # noqa: PERF203
+                return {
+                    "error": f"Conversion timed out after {timeout_override} seconds",
+                    "stdout": timeout_exc.stdout,
+                    "stderr": timeout_exc.stderr,
+                }
+            except subprocess.CalledProcessError as proc_exc:
+                return {
+                    "error": f"Conversion failed (exit code {proc_exc.returncode})",
+                    "stdout": proc_exc.stdout,
+                    "stderr": proc_exc.stderr,
+                }
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"Unexpected conversion failure: {exc}"}
+
+            if not output_path.exists():
+                return {
+                    "error": "Conversion completed but output file is missing",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
+
+            output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
+
             return {
-                "error": f"Conversion timed out after {timeout_override} seconds",
-                "stdout": timeout_exc.stdout,
-                "stderr": timeout_exc.stderr,
-            }
-        except subprocess.CalledProcessError as proc_exc:
-            return {
-                "error": f"Conversion failed (exit code {proc_exc.returncode})",
-                "stdout": proc_exc.stdout,
-                "stderr": proc_exc.stderr,
-            }
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"Unexpected conversion failure: {exc}"}
-
-        if not output_path.exists():
-            return {
-                "error": "Conversion completed but output file is missing",
+                "base_video_b64": output_b64,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
             }
-
-        output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
-
-        return {
-            "base_video_b64": output_b64,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"RunPod handler crashed: {exc}"}
 
 
 if __name__ == "__main__":

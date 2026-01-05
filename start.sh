@@ -16,5 +16,10 @@ if [[ "$1" == "python" && "$2" == "/app/runpod_pod_server.py" ]]; then
     exec python "$@"
 fi
 
-# Fallback to convert.sh with provided arguments.
-exec /app/convert.sh "$@"
+# If arguments were provided, treat them as convert.sh invocation (legacy/pod mode).
+if [[ "$#" -gt 0 ]]; then
+    exec /app/convert.sh "$@"
+fi
+
+# Default: run the RunPod serverless handler (expected in serverless deployments).
+exec python /app/runpod_handler.py
