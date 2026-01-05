@@ -1,6 +1,8 @@
 import base64
+import html
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,6 +22,17 @@ DEFAULT_DOWNLOAD_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     )
 }
+DIRECT_AUDIO_HINTS = (
+    "download.aspx",
+    ".files.1drv.com",
+    ".download.",
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".m4a",
+    "drive.google.com/uc",
+    "googleusercontent.com",
+)
 
 
 class ConversionError(Exception):
@@ -47,41 +60,99 @@ def _normalize_storage_url(url: str) -> str:
     elif "onedrive" in host or "1drv.ms" in host or "sharepoint.com" in host:
         query["download"] = "1"
         parsed = parsed._replace(query=urlencode(query))
+    elif "drive.google.com" in host or "docs.google.com" in host:
+        file_id = None
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 3 and path_parts[0] == "file" and path_parts[1] == "d":
+            file_id = path_parts[2]
+        elif "id" in query:
+            file_id = query["id"]
+        if file_id:
+            parsed = parsed._replace(
+                scheme="https",
+                netloc="drive.google.com",
+                path="/uc",
+                query=urlencode({"export": "download", "id": file_id}),
+            )
 
     return urlunparse(parsed)
 
 
+def _extract_direct_audio_url(html_text: str) -> str | None:
+    def _clean(candidate: str) -> str:
+        decoded = html.unescape(candidate)
+        try:
+            decoded = bytes(decoded, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            pass
+        return decoded
+
+    patterns = [
+        re.compile(r'window\.location(?:\.replace|\.href)?\s*\(\s*[\'"]([^\'"]+)[\'"]', re.IGNORECASE),
+        re.compile(r'content\s*=\s*"\d+;\s*url=([^"]+)"', re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        match = pattern.search(html_text)
+        if match:
+            return _clean(match.group(1))
+
+    google_patterns = [
+        re.compile(r'href="(https://drive\.google\.com/uc\?[^"]+)"', re.IGNORECASE),
+        re.compile(r'"downloadUrl":"(https:[^"]+)"', re.IGNORECASE),
+        re.compile(r'data-url="(https://[^"]+googleusercontent\.com[^"]+)"', re.IGNORECASE),
+    ]
+    for pattern in google_patterns:
+        match = pattern.search(html_text)
+        if match:
+            return _clean(match.group(1))
+
+    candidates = re.findall(r'https?://[^\s"\']+', html_text)
+    for candidate in candidates:
+        cleaned = _clean(candidate)
+        lowered = cleaned.lower()
+        if any(hint in lowered for hint in DIRECT_AUDIO_HINTS):
+            return cleaned
+    return None
+
+
 def _download_from_url(audio_url: str, target: Path) -> None:
     normalized = _normalize_storage_url(audio_url)
-    try:
-        head_resp = requests.head(
-            normalized,
-            allow_redirects=True,
-            timeout=30,
-            headers=DEFAULT_DOWNLOAD_HEADERS,
-        )
-        head_resp.raise_for_status()
-        content_type = head_resp.headers.get("Content-Type", "")
-        if content_type and not content_type.lower().startswith("audio/"):
-            raise ConversionError("Remote URL did not return an audio file (content-type mismatch)")
+    session = requests.Session()
+    url = normalized
 
-        with requests.get(
-            normalized,
+    for _ in range(4):
+        with session.get(
+            url,
             stream=True,
             timeout=120,
             allow_redirects=True,
             headers=DEFAULT_DOWNLOAD_HEADERS,
         ) as response:
             response.raise_for_status()
-            content_type = response.headers.get("Content-Type", content_type)
-            if not content_type.lower().startswith("audio/"):
-                raise ConversionError("Remote URL did not return an audio file")
-            with target.open("wb") as out_file:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
+            content_type = response.headers.get("Content-Type", "") or ""
+            if content_type.lower().startswith("audio/"):
+                with target.open("wb") as out_file:
+                    total = 0
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
                         out_file.write(chunk)
-    except Exception as exc:  # noqa: BLE001
-        raise ConversionError(f"Failed to download audio from URL: {exc}") from exc
+                if os.path.getsize(target) == 0:
+                    target.unlink(missing_ok=True)
+                    raise ConversionError("Remote download returned an empty file.")
+                return
+
+            html_text = response.content.decode("utf-8", errors="ignore")
+        direct_url = _extract_direct_audio_url(html_text)
+        if direct_url:
+            url = direct_url
+            continue
+        raise ConversionError(
+            "Remote URL returned HTML or requires authentication. Ensure the link is publicly accessible."
+        )
+
+    raise ConversionError("Could not resolve remote audio after multiple attempts.")
 
 
 def _build_command(
