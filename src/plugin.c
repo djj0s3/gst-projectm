@@ -18,6 +18,12 @@
 #ifndef GL_MAP_READ_BIT
 #define GL_MAP_READ_BIT 0x0001
 #endif
+#ifndef GL_RGBA8
+#define GL_RGBA8 0x8058
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
 
 #define GST_PROJECTM_TIMELINE_EPSILON (1e-6)
 #define GST_PROJECTM_PBO_COUNT 3
@@ -58,6 +64,11 @@ static gboolean gst_projectm_ensure_pbos(GstProjectM *plugin,
                                          gsize width, gsize height);
 static void gst_projectm_release_pbos(GstProjectM *plugin,
                                       const GstGLFuncs *glFunctions);
+static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
+                                                  const GstGLFuncs *glFunctions,
+                                                  gsize width, gsize height);
+static void gst_projectm_release_render_target(GstProjectM *plugin,
+                                               const GstGLFuncs *glFunctions);
 static gboolean gst_projectm_download_frame_with_pbo(
     GstProjectM *plugin, const GstGLFuncs *glFunctions, GstVideoFrame *video,
     gsize width, gsize height);
@@ -83,6 +94,12 @@ struct _GstProjectMPrivate {
   guint pbo_index;
   gboolean pbo_initialized;
   gboolean pbo_frame_valid;
+
+  GLuint fbo_id;
+  GLuint fbo_texture_id;
+  gsize fbo_width;
+  gsize fbo_height;
+  gboolean fbo_initialized;
 };
 
 G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
@@ -539,6 +556,101 @@ static void gst_projectm_release_pbos(GstProjectM *plugin,
   priv->pbo_frame_valid = FALSE;
 }
 
+static gboolean gst_projectm_has_rt_support(const GstGLFuncs *glFunctions) {
+  return glFunctions && glFunctions->GenFramebuffers &&
+         glFunctions->DeleteFramebuffers && glFunctions->BindFramebuffer &&
+         glFunctions->FramebufferTexture2D && glFunctions->GenTextures &&
+         glFunctions->DeleteTextures && glFunctions->BindTexture &&
+         glFunctions->TexImage2D && glFunctions->TexParameteri;
+}
+
+static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
+                                                  const GstGLFuncs *glFunctions,
+                                                  gsize width, gsize height) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!gst_projectm_has_rt_support(glFunctions)) {
+    return FALSE;
+  }
+
+  if (priv->fbo_initialized && priv->fbo_width == width &&
+      priv->fbo_height == height) {
+    return TRUE;
+  }
+
+  gst_projectm_release_render_target(plugin, glFunctions);
+
+  GLuint new_fbo = 0;
+  GLuint new_tex = 0;
+  glFunctions->GenFramebuffers(1, &new_fbo);
+  glFunctions->GenTextures(1, &new_tex);
+
+  glFunctions->BindTexture(GL_TEXTURE_2D, new_tex);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                             GL_CLAMP_TO_EDGE);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                             GL_CLAMP_TO_EDGE);
+  glFunctions->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width,
+                          (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  glFunctions->BindTexture(GL_TEXTURE_2D, 0);
+
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, new_fbo);
+  glFunctions->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, new_tex, 0);
+
+  gboolean success = TRUE;
+  if (glFunctions->CheckFramebufferStatus) {
+    GLenum status = glFunctions->CheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+      GST_ERROR_OBJECT(plugin,
+                       "Failed to build framebuffer for headless rendering "
+                       "(status=0x%x)",
+                       status);
+      success = FALSE;
+    }
+  }
+
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+
+  if (!success) {
+    glFunctions->DeleteFramebuffers(1, &new_fbo);
+    glFunctions->DeleteTextures(1, &new_tex);
+    return FALSE;
+  }
+
+  priv->fbo_id = new_fbo;
+  priv->fbo_texture_id = new_tex;
+  priv->fbo_width = width;
+  priv->fbo_height = height;
+  priv->fbo_initialized = TRUE;
+
+  return TRUE;
+}
+
+static void gst_projectm_release_render_target(GstProjectM *plugin,
+                                               const GstGLFuncs *glFunctions) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (!priv->fbo_initialized) {
+    return;
+  }
+
+  if (glFunctions && glFunctions->DeleteFramebuffers && priv->fbo_id != 0) {
+    glFunctions->DeleteFramebuffers(1, &priv->fbo_id);
+  }
+  if (glFunctions && glFunctions->DeleteTextures && priv->fbo_texture_id != 0) {
+    glFunctions->DeleteTextures(1, &priv->fbo_texture_id);
+  }
+
+  priv->fbo_id = 0;
+  priv->fbo_texture_id = 0;
+  priv->fbo_width = 0;
+  priv->fbo_height = 0;
+  priv->fbo_initialized = FALSE;
+}
+
 static gboolean gst_projectm_download_frame_with_pbo(
     GstProjectM *plugin, const GstGLFuncs *glFunctions, GstVideoFrame *video,
     gsize width, gsize height) {
@@ -806,6 +918,11 @@ static void gst_projectm_init(GstProjectM *plugin) {
   plugin->priv->pbo_width = 0;
   plugin->priv->pbo_height = 0;
   plugin->priv->pbo_index = 0;
+  plugin->priv->fbo_id = 0;
+  plugin->priv->fbo_texture_id = 0;
+  plugin->priv->fbo_width = 0;
+  plugin->priv->fbo_height = 0;
+  plugin->priv->fbo_initialized = FALSE;
 }
 
 static void gst_projectm_finalize(GObject *object) {
@@ -833,6 +950,7 @@ static void gst_projectm_gl_stop(GstGLBaseAudioVisualizer *src) {
   }
 
   gst_projectm_release_pbos(plugin, glFunctions);
+  gst_projectm_release_render_target(plugin, glFunctions);
   plugin->priv->current_timeline_index = -1;
   plugin->priv->timeline_initialized = FALSE;
   plugin->priv->first_frame_received = FALSE;
@@ -979,6 +1097,24 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
 
   projectm_get_window_size(plugin->priv->handle, &windowWidth, &windowHeight);
 
+  gboolean using_fbo = gst_projectm_ensure_render_target(
+      plugin, glFunctions, windowWidth, windowHeight);
+  gboolean restore_viewport = FALSE;
+  GLint previous_viewport[4] = {0, 0, 0, 0};
+
+  if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, plugin->priv->fbo_id);
+    if (glFunctions->Viewport) {
+      if (glFunctions->GetIntegerv) {
+        glFunctions->GetIntegerv(GL_VIEWPORT, previous_viewport);
+        restore_viewport = TRUE;
+      }
+      glFunctions->Viewport(0, 0, (GLsizei)windowWidth, (GLsizei)windowHeight);
+    }
+  } else if (glFunctions && glFunctions->BindFramebuffer) {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  }
+
   projectm_opengl_render_frame(plugin->priv->handle);
   gl_error_handler(glav->context, plugin);
 
@@ -993,6 +1129,14 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
     glFunctions->ReadPixels(0, 0, windowWidth, windowHeight,
                             plugin->priv->gl_format, GL_UNSIGNED_INT_8_8_8_8,
                             (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 0));
+  }
+
+  if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (restore_viewport && glFunctions->Viewport) {
+      glFunctions->Viewport(previous_viewport[0], previous_viewport[1],
+                            previous_viewport[2], previous_viewport[3]);
+    }
   }
 
   gst_buffer_unmap(audio, &audioMap);

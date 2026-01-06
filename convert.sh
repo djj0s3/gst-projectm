@@ -47,9 +47,11 @@ use_headless_gpu() {
     echo "Using EGL headless GPU rendering (DISPLAY unset)."
     unset DISPLAY
     export GST_GL_PLATFORM=${GST_GL_PLATFORM:-egl}
-    export GST_GL_WINDOW=${GST_GL_WINDOW:-none}
-    export GST_GL_API=${GST_GL_API:-opengl}
+    export GST_GL_WINDOW=${GST_GL_WINDOW:-surfaceless}
+    export GST_GL_API=${GST_GL_API:-opengl3}
     export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
+    export GST_GL_EGL_PLATFORM=${GST_GL_EGL_PLATFORM:-surfaceless}
+    export EGL_PLATFORM=${EGL_PLATFORM:-surfaceless}
 }
 
 set_auto_mesh() {
@@ -333,8 +335,8 @@ case "$ENCODER" in
     x264)
         ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! x264enc bitrate=$BITRATE speed-preset=$SPEED_PRESET key-int-max=$KEY_INT threads=0"
         ;;
-    nvh264)
-        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! nvh264enc bitrate=$BITRATE preset=hp rc-mode=cbr-hq gop-size=$KEY_INT iframeinterval=$KEY_INT"
+nvh264)
+        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! nvh264enc bitrate=$BITRATE preset=hp rc-mode=cbr-hq gop-size=$KEY_INT"
         ;;
     vaapih264)
         VAAPI_BITRATE=$BITRATE
@@ -352,6 +354,7 @@ esac
 
 AUDIO_QUEUE_OPTS="queue max-size-buffers=2048 max-size-bytes=0 max-size-time=0"
 VIDEO_QUEUE_OPTS="queue max-size-buffers=12 max-size-bytes=0 max-size-time=0 leaky=downstream"
+H264_POST_ENCODE_PIPELINE="h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au"
 
 # Run the actual conversion
 gst-launch-1.0 -e \
@@ -363,7 +366,7 @@ gst-launch-1.0 -e \
       t. ! $VIDEO_QUEUE_OPTS ! audioconvert ! projectm \
             ${PROJECTM_ARGS[@]} ! \
             ${ENCODER_PIPELINE} ! \
-            video/x-h264,stream-format=avc,alignment=au ! queue ! mux. \
+            ${H264_POST_ENCODE_PIPELINE} ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
 
 GST_PID=$!

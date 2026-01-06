@@ -24,6 +24,14 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
         gstreamer1.0-x \
         gstreamer1.0-tools \
         libgles2-mesa-dev \
+        libegl1 \
+        libegl-dev \
+        libglvnd0 \
+        libglvnd-dev \
+        libgbm1 \
+        libgbm-dev \
+        libdrm2 \
+        libdrm-dev \
         mesa-utils \
         python3 \
         python3-pip \
