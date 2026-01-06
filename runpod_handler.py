@@ -1,10 +1,12 @@
 import base64
 import html
 import json
+import logging
 import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -33,6 +35,20 @@ DIRECT_AUDIO_HINTS = (
     "drive.google.com/uc",
     "googleusercontent.com",
 )
+LOG_LEVEL = os.environ.get("RUNPOD_LOG_LEVEL", "INFO").upper()
+LOG_STD_TAIL = int(os.environ.get("RUNPOD_LOG_STD_TAIL", "1200"))
+
+LOGGER = logging.getLogger("projectm.runpod")
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    LOGGER.addHandler(handler)
+
+try:
+    LOGGER.setLevel(getattr(logging, LOG_LEVEL))
+except AttributeError:
+    LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
 
 
 class ConversionError(Exception):
@@ -213,12 +229,26 @@ def _build_command(
     return cmd
 
 
+def _tail_text(text: str | None, max_chars: int = LOG_STD_TAIL) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return f"...{text[-max_chars:]}"
+
+
 def handler(job):
+    job_id = None
     try:
+        if isinstance(job, dict):
+            job_id = job.get("id")
+        LOGGER.info("Received RunPod request%s", f" {job_id}" if job_id else "")
+
         input_payload = job.get("input") or {}
         audio_b64 = input_payload.get("audio_b64")
         audio_url = input_payload.get("audio_url")
         if not audio_b64 and not audio_url:
+            LOGGER.error("Job %s missing audio_b64/audio_url input", job_id or "unknown")
             return {"error": "Missing audio_b64 or audio_url in payload"}
 
         audio_name = input_payload.get("audio_filename") or "input_audio"
@@ -226,28 +256,43 @@ def handler(job):
 
         timeline_ini = input_payload.get("timeline_ini")
         timeout_override = float(input_payload.get("timeout_sec") or DEFAULT_TIMEOUT_SEC)
+        LOGGER.info(
+            "Job %s - timeout %.0f sec, mesh=%s, fps=%s, bitrate=%s kbps",
+            job_id or "unknown",
+            timeout_override,
+            input_payload.get("mesh") or os.environ.get("PROJECTM_MESH", "320x240"),
+            input_payload.get("fps", 60),
+            input_payload.get("bitrate_kbps", 8000),
+        )
 
         with tempfile.TemporaryDirectory(prefix="runpod_projectm_") as tmp_dir:
             tmp_path = Path(tmp_dir)
             audio_path = tmp_path / f"audio{suffix}"
             if audio_b64:
+                LOGGER.info("Job %s - received inline audio payload", job_id or "unknown")
                 _write_binary_file(audio_path, audio_b64)
             elif audio_url:
+                LOGGER.info("Job %s - downloading audio from %s", job_id or "unknown", audio_url)
                 try:
                     _download_from_url(audio_url, audio_path)
                 except ConversionError as exc:
+                    LOGGER.error("Job %s - download failed: %s", job_id or "unknown", exc)
                     return {"error": f"Remote download failed: {exc}"}
+                LOGGER.info("Job %s - download complete (%d bytes)", job_id or "unknown", audio_path.stat().st_size)
 
             timeline_path = None
             if timeline_ini:
+                LOGGER.info("Job %s - using inline timeline.ini payload", job_id or "unknown")
                 timeline_path = tmp_path / "timeline.ini"
                 timeline_path.write_text(timeline_ini, encoding="utf-8")
 
             output_path = tmp_path / DEFAULT_OUTPUT_NAME
 
             cmd = _build_command(audio_path, output_path, timeline_path, input_payload)
+            LOGGER.info("Job %s - executing convert.sh command: %s", job_id or "unknown", " ".join(cmd))
 
             try:
+                start_time = time.perf_counter()
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -255,22 +300,30 @@ def handler(job):
                     check=True,
                     timeout=timeout_override,
                 )
+                elapsed = time.perf_counter() - start_time
+                LOGGER.info("Job %s - convert.sh completed in %.1fs", job_id or "unknown", elapsed)
             except subprocess.TimeoutExpired as timeout_exc:  # noqa: PERF203
+                LOGGER.error("Job %s - conversion timed out after %.0f seconds", job_id or "unknown", timeout_override)
                 return {
                     "error": f"Conversion timed out after {timeout_override} seconds",
                     "stdout": timeout_exc.stdout,
                     "stderr": timeout_exc.stderr,
                 }
             except subprocess.CalledProcessError as proc_exc:
+                LOGGER.error(
+                    "Job %s - conversion failed with exit code %s", job_id or "unknown", proc_exc.returncode
+                )
                 return {
                     "error": f"Conversion failed (exit code {proc_exc.returncode})",
                     "stdout": proc_exc.stdout,
                     "stderr": proc_exc.stderr,
                 }
             except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("Job %s - unexpected conversion failure", job_id or "unknown")
                 return {"error": f"Unexpected conversion failure: {exc}"}
 
             if not output_path.exists():
+                LOGGER.error("Job %s - output missing after conversion", job_id or "unknown")
                 return {
                     "error": "Conversion completed but output file is missing",
                     "stdout": result.stdout,
@@ -278,6 +331,9 @@ def handler(job):
                 }
 
             output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
+            LOGGER.info(
+                "Job %s - returning video (%d bytes before base64)", job_id or "unknown", output_path.stat().st_size
+            )
 
             return {
                 "base_video_b64": output_b64,
@@ -285,6 +341,7 @@ def handler(job):
                 "stderr": result.stderr,
             }
     except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Job %s - handler crashed", job_id or "unknown")
         return {"error": f"RunPod handler crashed: {exc}"}
 
 

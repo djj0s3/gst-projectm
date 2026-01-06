@@ -16,6 +16,7 @@ SPEED_PRESET="medium"
 ENCODER="auto"
 FORCE_GPU=0
 FORCE_XVFB=0
+FORCE_GL_DOWNLOAD=${FORCE_GL_DOWNLOAD:-0}
 MESH_CUSTOM=0
 
 # Process IDs for the gst-launch process and Xvfb
@@ -36,11 +37,34 @@ has_gpu() {
     return 1
 }
 
+gpu_accessible() {
+    for dev in /dev/dri/renderD* /dev/dri/card* /dev/nvidia0; do
+        if [ -e "$dev" ]; then
+            if [ -r "$dev" ] || [ -w "$dev" ]; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
 start_xvfb() {
     echo "Starting Xvfb (software rendering fallback)..."
-    Xvfb :99 -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 &
-    XVFB_PID=$!
     export DISPLAY=:99
+    export LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-1}
+    export GALLIUM_DRIVER=${GALLIUM_DRIVER:-llvmpipe}
+    export LIBGL_DRIVERS_PATH=${LIBGL_DRIVERS_PATH:-/usr/lib/x86_64-linux-gnu/dri}
+    export MESA_GL_VERSION_OVERRIDE=${MESA_GL_VERSION_OVERRIDE:-4.5}
+    export MESA_GLSL_VERSION_OVERRIDE=${MESA_GLSL_VERSION_OVERRIDE:-450}
+    export GST_GL_PLATFORM=${GST_GL_PLATFORM:-x11}
+    export GST_GL_WINDOW=${GST_GL_WINDOW:-x11}
+    export GST_GL_API=${GST_GL_API:-opengl}
+    export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
+    export GST_GL_EGL_PLATFORM=${GST_GL_EGL_PLATFORM:-x11}
+    export EGL_PLATFORM=${EGL_PLATFORM:-x11}
+    Xvfb :99 -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 -nolisten tcp -noreset &
+    XVFB_PID=$!
 }
 
 use_headless_gpu() {
@@ -271,8 +295,18 @@ elif [ "$FORCE_GPU" -eq 1 ]; then
     fi
 else
     if has_gpu; then
-        use_gpu=1
-        use_headless_gpu
+        if gpu_accessible; then
+            use_gpu=1
+            use_headless_gpu
+        else
+            if [ "$FORCE_GPU" -eq 1 ]; then
+                echo "Error: GPU detected but access to /dev/dri/* was denied. Ensure the container has the correct device permissions."
+                exit 1
+            fi
+            echo "GPU detected but device nodes are not accessible; falling back to software rendering via Xvfb."
+            use_gpu=0
+            start_xvfb
+        fi
     else
         echo "No GPU detected; falling back to software rendering via Xvfb"
         use_gpu=0
@@ -331,20 +365,24 @@ fi
 PROJECTM_ARGS+=("mesh-size=${MESH_X},${MESH_Y}")
 
 KEY_INT=$((FRAMERATE * 2))
+GL_DOWNLOAD_PIPELINE=""
+if [ "$use_gpu" -eq 1 ] || [ "$FORCE_GL_DOWNLOAD" -eq 1 ]; then
+    GL_DOWNLOAD_PIPELINE="glcolorconvert ! gldownload ! "
+fi
 case "$ENCODER" in
     x264)
-        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! x264enc bitrate=$BITRATE speed-preset=$SPEED_PRESET key-int-max=$KEY_INT threads=0"
+        ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! x264enc bitrate=$BITRATE speed-preset=$SPEED_PRESET key-int-max=$KEY_INT threads=0"
         ;;
 nvh264)
-        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! nvh264enc bitrate=$BITRATE preset=hp rc-mode=cbr-hq gop-size=$KEY_INT"
+        ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! nvh264enc bitrate=$BITRATE preset=hp rc-mode=cbr-hq gop-size=$KEY_INT"
         ;;
     vaapih264)
         VAAPI_BITRATE=$BITRATE
-        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! vaapih264enc bitrate=$VAAPI_BITRATE keyframe-period=$KEY_INT"
+        ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! vaapih264enc bitrate=$VAAPI_BITRATE keyframe-period=$KEY_INT"
         ;;
     qsvh264)
         QSV_BITRATE=$BITRATE
-        ENCODER_PIPELINE="videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! msdkh264enc bitrate=$QSV_BITRATE rate-control=cbr gop-size=$KEY_INT"
+        ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! msdkh264enc bitrate=$QSV_BITRATE rate-control=cbr gop-size=$KEY_INT"
         ;;
     *)
         echo "Unsupported encoder '$ENCODER'. Supported encoders: x264, nvh264, vaapih264, qsvh264"

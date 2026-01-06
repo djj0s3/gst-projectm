@@ -24,6 +24,30 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
+#ifndef GL_COLOR_ATTACHMENT0
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#endif
+#ifndef GL_DRAW_BUFFER
+#define GL_DRAW_BUFFER 0x0C01
+#endif
+#ifndef GL_RENDERBUFFER
+#define GL_RENDERBUFFER 0x8D41
+#endif
+#ifndef GL_DEPTH_ATTACHMENT
+#define GL_DEPTH_ATTACHMENT 0x8D00
+#endif
+#ifndef GL_STENCIL_ATTACHMENT
+#define GL_STENCIL_ATTACHMENT 0x8D20
+#endif
+#ifndef GL_DEPTH_COMPONENT24
+#define GL_DEPTH_COMPONENT24 0x81A6
+#endif
+#ifndef GL_DEPTH_COMPONENT16
+#define GL_DEPTH_COMPONENT16 0x81A5
+#endif
+#ifndef GL_DEPTH24_STENCIL8
+#define GL_DEPTH24_STENCIL8 0x88F0
+#endif
 
 #define GST_PROJECTM_TIMELINE_EPSILON (1e-6)
 #define GST_PROJECTM_PBO_COUNT 3
@@ -97,9 +121,11 @@ struct _GstProjectMPrivate {
 
   GLuint fbo_id;
   GLuint fbo_texture_id;
+  GLuint fbo_depth_buffer_id;
   gsize fbo_width;
   gsize fbo_height;
   gboolean fbo_initialized;
+  gboolean fbo_warned_missing_support;
 };
 
 G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
@@ -556,12 +582,33 @@ static void gst_projectm_release_pbos(GstProjectM *plugin,
   priv->pbo_frame_valid = FALSE;
 }
 
-static gboolean gst_projectm_has_rt_support(const GstGLFuncs *glFunctions) {
-  return glFunctions && glFunctions->GenFramebuffers &&
-         glFunctions->DeleteFramebuffers && glFunctions->BindFramebuffer &&
-         glFunctions->FramebufferTexture2D && glFunctions->GenTextures &&
-         glFunctions->DeleteTextures && glFunctions->BindTexture &&
-         glFunctions->TexImage2D && glFunctions->TexParameteri;
+static gboolean
+gst_projectm_has_rt_support(GstProjectM *plugin,
+                            const GstGLFuncs *glFunctions) {
+#define GST_PROJECTM_REQUIRE_GL_FUNC(func)                                     \
+  if (!glFunctions || !glFunctions->func) {                                   \
+    if (!plugin->priv->fbo_warned_missing_support) {                          \
+      GST_WARNING_OBJECT(plugin,                                              \
+                         "GL function %s is unavailable; falling back to "    \
+                         "default framebuffer",                               \
+                         #func);                                              \
+      plugin->priv->fbo_warned_missing_support = TRUE;                        \
+    }                                                                         \
+    return FALSE;                                                             \
+  }
+
+  GST_PROJECTM_REQUIRE_GL_FUNC(GenFramebuffers);
+  GST_PROJECTM_REQUIRE_GL_FUNC(DeleteFramebuffers);
+  GST_PROJECTM_REQUIRE_GL_FUNC(BindFramebuffer);
+  GST_PROJECTM_REQUIRE_GL_FUNC(FramebufferTexture2D);
+  GST_PROJECTM_REQUIRE_GL_FUNC(GenTextures);
+  GST_PROJECTM_REQUIRE_GL_FUNC(DeleteTextures);
+  GST_PROJECTM_REQUIRE_GL_FUNC(BindTexture);
+  GST_PROJECTM_REQUIRE_GL_FUNC(TexImage2D);
+  GST_PROJECTM_REQUIRE_GL_FUNC(TexParameteri);
+
+#undef GST_PROJECTM_REQUIRE_GL_FUNC
+  return TRUE;
 }
 
 static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
@@ -569,7 +616,7 @@ static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
                                                   gsize width, gsize height) {
   GstProjectMPrivate *priv = plugin->priv;
 
-  if (!gst_projectm_has_rt_support(glFunctions)) {
+  if (!gst_projectm_has_rt_support(plugin, glFunctions)) {
     return FALSE;
   }
 
@@ -582,6 +629,7 @@ static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
 
   GLuint new_fbo = 0;
   GLuint new_tex = 0;
+  GLuint new_depth = 0;
   glFunctions->GenFramebuffers(1, &new_fbo);
   glFunctions->GenTextures(1, &new_tex);
 
@@ -600,6 +648,42 @@ static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
   glFunctions->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                     GL_TEXTURE_2D, new_tex, 0);
 
+  if (glFunctions->DrawBuffers) {
+    GLenum draw_buffer = GL_COLOR_ATTACHMENT0;
+    glFunctions->DrawBuffers(1, &draw_buffer);
+  } else if (glFunctions->DrawBuffer) {
+    glFunctions->DrawBuffer(GL_COLOR_ATTACHMENT0);
+  }
+  if (glFunctions->ReadBuffer) {
+    glFunctions->ReadBuffer(GL_COLOR_ATTACHMENT0);
+  }
+
+  if (glFunctions->GenRenderbuffers && glFunctions->DeleteRenderbuffers &&
+      glFunctions->BindRenderbuffer && glFunctions->RenderbufferStorage &&
+      glFunctions->FramebufferRenderbuffer) {
+    glFunctions->GenRenderbuffers(1, &new_depth);
+    glFunctions->BindRenderbuffer(GL_RENDERBUFFER, new_depth);
+#ifdef GL_DEPTH24_STENCIL8
+    glFunctions->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8,
+                                     (GLsizei)width, (GLsizei)height);
+    glFunctions->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                         GL_RENDERBUFFER, new_depth);
+    glFunctions->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                         GL_RENDERBUFFER, new_depth);
+#else
+    glFunctions->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
+                                     (GLsizei)width, (GLsizei)height);
+    glFunctions->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                         GL_RENDERBUFFER, new_depth);
+#endif
+    glFunctions->BindRenderbuffer(GL_RENDERBUFFER, 0);
+  } else if (!priv->fbo_warned_missing_support) {
+    GST_DEBUG_OBJECT(plugin,
+                     "Renderbuffer functions unavailable; continuing without "
+                     "depth attachment");
+    priv->fbo_warned_missing_support = TRUE;
+  }
+
   gboolean success = TRUE;
   if (glFunctions->CheckFramebufferStatus) {
     GLenum status = glFunctions->CheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -617,11 +701,15 @@ static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
   if (!success) {
     glFunctions->DeleteFramebuffers(1, &new_fbo);
     glFunctions->DeleteTextures(1, &new_tex);
+    if (new_depth != 0 && glFunctions->DeleteRenderbuffers) {
+      glFunctions->DeleteRenderbuffers(1, &new_depth);
+    }
     return FALSE;
   }
 
   priv->fbo_id = new_fbo;
   priv->fbo_texture_id = new_tex;
+  priv->fbo_depth_buffer_id = new_depth;
   priv->fbo_width = width;
   priv->fbo_height = height;
   priv->fbo_initialized = TRUE;
@@ -643,12 +731,18 @@ static void gst_projectm_release_render_target(GstProjectM *plugin,
   if (glFunctions && glFunctions->DeleteTextures && priv->fbo_texture_id != 0) {
     glFunctions->DeleteTextures(1, &priv->fbo_texture_id);
   }
+  if (glFunctions && glFunctions->DeleteRenderbuffers &&
+      priv->fbo_depth_buffer_id != 0) {
+    glFunctions->DeleteRenderbuffers(1, &priv->fbo_depth_buffer_id);
+  }
 
   priv->fbo_id = 0;
   priv->fbo_texture_id = 0;
+  priv->fbo_depth_buffer_id = 0;
   priv->fbo_width = 0;
   priv->fbo_height = 0;
   priv->fbo_initialized = FALSE;
+  priv->fbo_warned_missing_support = FALSE;
 }
 
 static gboolean gst_projectm_download_frame_with_pbo(
@@ -920,9 +1014,11 @@ static void gst_projectm_init(GstProjectM *plugin) {
   plugin->priv->pbo_index = 0;
   plugin->priv->fbo_id = 0;
   plugin->priv->fbo_texture_id = 0;
+  plugin->priv->fbo_depth_buffer_id = 0;
   plugin->priv->fbo_width = 0;
   plugin->priv->fbo_height = 0;
   plugin->priv->fbo_initialized = FALSE;
+  plugin->priv->fbo_warned_missing_support = FALSE;
 }
 
 static void gst_projectm_finalize(GObject *object) {
