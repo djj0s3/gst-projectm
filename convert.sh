@@ -316,6 +316,35 @@ fi
 
 select_best_encoder
 
+# Add diagnostic logging for debugging Runpod issues
+echo "=== Environment Diagnostics ==="
+echo "Hostname: $(hostname)"
+echo "GPU Detection: use_gpu=$use_gpu"
+echo "DISPLAY: ${DISPLAY:-unset}"
+echo "NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-unset}"
+echo "GST_PLUGIN_PATH: ${GST_PLUGIN_PATH:-unset}"
+echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-unset}"
+
+# Check for GPU devices
+if [ "$use_gpu" -eq 1 ]; then
+    echo "GPU devices found:"
+    ls -la /dev/nvidia* 2>&1 || echo "  No /dev/nvidia* devices"
+    ls -la /dev/dri/* 2>&1 || echo "  No /dev/dri/* devices"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "nvidia-smi output:"
+        nvidia-smi 2>&1 || echo "  nvidia-smi failed"
+    fi
+fi
+
+# Check for GStreamer projectm plugin
+echo "GStreamer projectm plugin check:"
+gst-inspect-1.0 projectm 2>&1 || echo "  ERROR: projectm plugin not found!"
+
+# Check for input/output file accessibility
+echo "Input file: $INPUT_FILE ($(stat -c%s "$INPUT_FILE" 2>/dev/null || stat -f%z "$INPUT_FILE" 2>/dev/null || echo "unknown") bytes)"
+echo "Output directory: $(dirname "$OUTPUT_FILE") (writable: $(test -w "$(dirname "$OUTPUT_FILE")" && echo "yes" || echo "NO"))"
+echo "==================================="
+
 if [ -z "$INSIDE_DOCKER" ]; then
     export INSIDE_DOCKER=1
 fi

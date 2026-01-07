@@ -302,6 +302,12 @@ def handler(job):
                 )
                 elapsed = time.perf_counter() - start_time
                 LOGGER.info("Job %s - convert.sh completed in %.1fs", job_id or "unknown", elapsed)
+
+                # Log stdout/stderr even on success for debugging
+                if result.stdout:
+                    LOGGER.info("Job %s - STDOUT: %s", job_id or "unknown", _tail_text(result.stdout, 2000))
+                if result.stderr:
+                    LOGGER.info("Job %s - STDERR: %s", job_id or "unknown", _tail_text(result.stderr, 2000))
             except subprocess.TimeoutExpired as timeout_exc:  # noqa: PERF203
                 LOGGER.error("Job %s - conversion timed out after %.0f seconds", job_id or "unknown", timeout_override)
                 return {
@@ -313,6 +319,12 @@ def handler(job):
                 LOGGER.error(
                     "Job %s - conversion failed with exit code %s", job_id or "unknown", proc_exc.returncode
                 )
+                # Log the actual error output to help debug
+                if proc_exc.stdout:
+                    LOGGER.error("Job %s - STDOUT: %s", job_id or "unknown", _tail_text(proc_exc.stdout))
+                if proc_exc.stderr:
+                    LOGGER.error("Job %s - STDERR: %s", job_id or "unknown", _tail_text(proc_exc.stderr))
+
                 return {
                     "error": f"Conversion failed (exit code {proc_exc.returncode})",
                     "stdout": proc_exc.stdout,
