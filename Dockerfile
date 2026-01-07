@@ -21,6 +21,7 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly \
+        gstreamer1.0-gl \
         gstreamer1.0-x \
         gstreamer1.0-tools \
         libgles2-mesa-dev \
