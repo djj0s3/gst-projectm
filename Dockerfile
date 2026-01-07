@@ -103,15 +103,23 @@ ENV PRESETS_DIR=/usr/local/share/projectM/presets
 ENV TEXTURES_DIR=/usr/local/share/projectM/textures
 ENV XDG_RUNTIME_DIR=/tmp
 
-# Setup for GPU access
+# Ensure GStreamer can find plugins
+ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/local/lib/gstreamer-1.0
+ENV GST_PLUGIN_SCANNER=/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
+
+# Setup for GPU access - respect Runpod's settings
 ENV LIBGL_ALWAYS_INDIRECT=0
-ENV NVIDIA_DRIVER_CAPABILITIES=all
-ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-all}
+# Don't override NVIDIA_VISIBLE_DEVICES if already set by Runpod
 
 # OpenGL debugging and shader compatibility
-ENV MESA_GL_VERSION_OVERRIDE=3.3
-ENV MESA_GLSL_VERSION_OVERRIDE=330
+# ProjectM needs at least OpenGL 3.3, use 4.5 for better compatibility
+ENV MESA_GL_VERSION_OVERRIDE=4.5
+ENV MESA_GLSL_VERSION_OVERRIDE=450
 ENV GST_GL_SHADER_DEBUG=0
+
+# Ensure libraries are found
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
 
 # Default entrypoint dispatches between conversion and server modes
 ENTRYPOINT ["/app/start.sh"]
