@@ -38,6 +38,15 @@ has_gpu() {
 }
 
 gpu_accessible() {
+    # First check if nvidia-smi actually works (GPU is functional)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if nvidia-smi >/dev/null 2>&1; then
+            # nvidia-smi works, GPU is accessible
+            return 0
+        fi
+    fi
+
+    # Otherwise check device nodes
     for dev in /dev/dri/renderD* /dev/dri/card* /dev/nvidia0; do
         if [ -e "$dev" ]; then
             if [ -r "$dev" ] || [ -w "$dev" ]; then
@@ -51,20 +60,33 @@ gpu_accessible() {
 
 start_xvfb() {
     echo "Starting Xvfb (software rendering fallback)..."
+
+    # Clean up stale X lock file if present
+    if [ -f /tmp/.X99-lock ]; then
+        echo "Removing stale X lock file..."
+        rm -f /tmp/.X99-lock
+    fi
+
+    # Kill any existing Xvfb on display 99
+    pkill -f "Xvfb :99" 2>/dev/null || true
+    sleep 0.5
+
     export DISPLAY=:99
     export LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-1}
     export GALLIUM_DRIVER=${GALLIUM_DRIVER:-llvmpipe}
     export LIBGL_DRIVERS_PATH=${LIBGL_DRIVERS_PATH:-/usr/lib/x86_64-linux-gnu/dri}
     export MESA_GL_VERSION_OVERRIDE=${MESA_GL_VERSION_OVERRIDE:-4.5}
     export MESA_GLSL_VERSION_OVERRIDE=${MESA_GLSL_VERSION_OVERRIDE:-450}
-    export GST_GL_PLATFORM=${GST_GL_PLATFORM:-x11}
+    # Use GLX instead of X11 for better compatibility with software rendering
+    export GST_GL_PLATFORM=${GST_GL_PLATFORM:-glx}
     export GST_GL_WINDOW=${GST_GL_WINDOW:-x11}
     export GST_GL_API=${GST_GL_API:-opengl}
     export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
-    export GST_GL_EGL_PLATFORM=${GST_GL_EGL_PLATFORM:-x11}
-    export EGL_PLATFORM=${EGL_PLATFORM:-x11}
-    Xvfb :99 -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 -nolisten tcp -noreset &
+    Xvfb :99 -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
     XVFB_PID=$!
+
+    # Wait for Xvfb to be ready
+    sleep 1
 }
 
 use_headless_gpu() {
