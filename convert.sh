@@ -80,7 +80,7 @@ start_xvfb() {
     # Use GLX instead of X11 for better compatibility with software rendering
     export GST_GL_PLATFORM=${GST_GL_PLATFORM:-glx}
     export GST_GL_WINDOW=${GST_GL_WINDOW:-x11}
-    export GST_GL_API=${GST_GL_API:-opengl}
+    export GST_GL_API=${GST_GL_API:-opengl3}
     export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
     Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
     XVFB_PID=$!
