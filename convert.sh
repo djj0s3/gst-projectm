@@ -61,17 +61,17 @@ gpu_accessible() {
 start_xvfb() {
     echo "Starting Xvfb (software rendering fallback)..."
 
+    # Use unique display number based on process ID to avoid conflicts
+    DISPLAY_NUM=$((99 + ($$  % 100)))
+    X_LOCK_FILE="/tmp/.X${DISPLAY_NUM}-lock"
+
     # Clean up stale X lock file if present
-    if [ -f /tmp/.X99-lock ]; then
+    if [ -f "$X_LOCK_FILE" ]; then
         echo "Removing stale X lock file..."
-        rm -f /tmp/.X99-lock
+        rm -f "$X_LOCK_FILE"
     fi
 
-    # Kill any existing Xvfb on display 99
-    pkill -f "Xvfb :99" 2>/dev/null || true
-    sleep 0.5
-
-    export DISPLAY=:99
+    export DISPLAY=:${DISPLAY_NUM}
     export LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-1}
     export GALLIUM_DRIVER=${GALLIUM_DRIVER:-llvmpipe}
     export LIBGL_DRIVERS_PATH=${LIBGL_DRIVERS_PATH:-/usr/lib/x86_64-linux-gnu/dri}
@@ -82,8 +82,9 @@ start_xvfb() {
     export GST_GL_WINDOW=${GST_GL_WINDOW:-x11}
     export GST_GL_API=${GST_GL_API:-opengl}
     export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
-    Xvfb :99 -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
+    Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
     XVFB_PID=$!
+    echo "Started Xvfb on display :${DISPLAY_NUM} (PID: $XVFB_PID)"
 
     # Wait for Xvfb to be ready
     sleep 1
