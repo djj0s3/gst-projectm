@@ -369,16 +369,33 @@ def handler(job):
                     "stderr": result.stderr,
                 }
 
-            output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
-            LOGGER.info(
-                "Job %s - returning video (%d bytes before base64)", job_id or "unknown", output_path.stat().st_size
-            )
+            # Upload video to Runpod's CDN instead of base64 encoding
+            file_size_mb = output_path.stat().st_size / (1024 * 1024)
+            LOGGER.info("Job %s - uploading video to Runpod CDN (%.2f MB)", job_id or "unknown", file_size_mb)
 
-            return {
-                "base_video_b64": output_b64,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
+            try:
+                # Upload file using runpod.upload_file()
+                video_url = runpod.upload_file(str(output_path))
+                LOGGER.info("Job %s - video uploaded successfully: %s", job_id or "unknown", video_url)
+
+                return {
+                    "video_url": video_url,
+                    "file_size_mb": round(file_size_mb, 2),
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
+            except Exception as upload_exc:  # noqa: BLE001
+                LOGGER.error("Job %s - failed to upload video to Runpod CDN: %s", job_id or "unknown", upload_exc)
+                # Fallback to base64 if upload fails
+                LOGGER.info("Job %s - falling back to base64 encoding", job_id or "unknown")
+                output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
+                return {
+                    "base_video_b64": output_b64,
+                    "file_size_mb": round(file_size_mb, 2),
+                    "upload_error": str(upload_exc),
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Job %s - handler crashed", job_id or "unknown")
         return {"error": f"RunPod handler crashed: {exc}"}
