@@ -304,39 +304,22 @@ if [ "$FORCE_XVFB" -eq 1 ] && [ "$FORCE_GPU" -eq 1 ]; then
 fi
 
 # Decide rendering backend
-if [ "$FORCE_XVFB" -eq 1 ]; then
-    use_gpu=0
-    start_xvfb
-elif [ "$FORCE_GPU" -eq 1 ]; then
-    if has_gpu; then
-        use_gpu=1
-        use_headless_gpu
-    else
-        echo "Error: --force-gpu requested but no GPU devices were detected"
-        exit 1
-    fi
-else
-    if has_gpu; then
-        if gpu_accessible; then
-            use_gpu=1
-            use_headless_gpu
-        else
-            if [ "$FORCE_GPU" -eq 1 ]; then
-                echo "Error: GPU detected but access to /dev/dri/* was denied. Ensure the container has the correct device permissions."
-                exit 1
-            fi
-            echo "GPU detected but device nodes are not accessible; falling back to software rendering via Xvfb."
-            use_gpu=0
-            start_xvfb
-        fi
-    else
-        echo "No GPU detected; falling back to software rendering via Xvfb"
-        use_gpu=0
-        start_xvfb
-    fi
+# NOTE: ProjectM doesn't work reliably with headless EGL, so always use Xvfb for rendering
+# But we still detect GPU for hardware encoding (nvh264enc)
+has_hw_encoder=0
+if has_gpu && gpu_accessible; then
+    has_hw_encoder=1
+    echo "GPU detected and accessible - will use for hardware encoding"
 fi
 
+# Always use Xvfb for ProjectM rendering (GL context works better with X11 than headless EGL)
+use_gpu=0
+start_xvfb
+
+# Override use_gpu temporarily for encoder selection, then restore
+use_gpu=$has_hw_encoder
 select_best_encoder
+use_gpu=0
 
 # Add diagnostic logging for debugging Runpod issues
 echo "=== Environment Diagnostics ==="
