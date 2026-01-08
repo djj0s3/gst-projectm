@@ -472,6 +472,12 @@ done
 wait $GST_PID
 EXIT_CODE=$?
 
+# Clean up Xvfb before exiting
+if [ ! -z "$XVFB_PID" ]; then
+    kill -TERM $XVFB_PID 2>/dev/null || true
+    # Don't wait for Xvfb to avoid blocking
+fi
+
 if [ $EXIT_CODE -eq 0 ]; then
     echo "Conversion complete! Output saved to $OUTPUT_FILE"
 else
