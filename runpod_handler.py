@@ -293,13 +293,40 @@ def handler(job):
 
             try:
                 start_time = time.perf_counter()
-                result = subprocess.run(
+                # Use Popen with real-time output to avoid buffering issues
+                process = subprocess.Popen(
                     cmd,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    check=True,
-                    timeout=timeout_override,
                 )
+
+                # Read output in real-time to prevent pipe buffer deadlocks
+                stdout_lines = []
+                stderr_lines = []
+
+                # Wait for process to complete with timeout
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout_override)
+                    stdout_lines = stdout.splitlines() if stdout else []
+                    stderr_lines = stderr.splitlines() if stderr else []
+                    returncode = process.returncode
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise
+
+                # Create result object compatible with subprocess.run()
+                class Result:
+                    def __init__(self, returncode, stdout, stderr):
+                        self.returncode = returncode
+                        self.stdout = stdout
+                        self.stderr = stderr
+
+                result = Result(returncode, stdout, stderr)
+
+                if result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
                 elapsed = time.perf_counter() - start_time
                 LOGGER.info("Job %s - convert.sh completed in %.1fs", job_id or "unknown", elapsed)
 
