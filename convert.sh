@@ -354,7 +354,13 @@ fi
 
 # Check for GStreamer projectm plugin
 echo "GStreamer projectm plugin check:"
-gst-inspect-1.0 projectm 2>&1 || echo "  ERROR: projectm plugin not found!"
+if gst-inspect-1.0 projectm >/dev/null 2>&1; then
+    echo "  ✓ projectm plugin found"
+    gst-inspect-1.0 projectm | grep -A 5 "Pad Templates" || true
+else
+    echo "  ERROR: projectm plugin not found!"
+    exit 1
+fi
 
 # Check for input/output file accessibility
 echo "Input file: $INPUT_FILE ($(stat -c%s "$INPUT_FILE" 2>/dev/null || stat -f%z "$INPUT_FILE" 2>/dev/null || echo "unknown") bytes)"
@@ -389,6 +395,20 @@ else
 fi
 if [ ! -z "$TIMELINE_FILE" ]; then
     echo "Timeline: $TIMELINE_FILE"
+    if [ ! -f "$TIMELINE_FILE" ]; then
+        echo "  WARNING: Timeline file does not exist!"
+    fi
+fi
+
+echo "ProjectM configuration:"
+echo "  Preset path: $PRESET_PATH"
+echo "  Texture dir: $TEXTURE_DIR"
+echo "  Mesh size: ${MESH_X}x${MESH_Y}"
+if [ ! -z "$TIMELINE_FILE" ]; then
+    echo "  Timeline: $TIMELINE_FILE"
+    echo "  Preset duration: (controlled by timeline)"
+else
+    echo "  Preset duration: ${PRESET_DURATION}s (randomized presets)"
 fi
 
 if [ "$use_gpu" -eq 0 ]; then
@@ -438,18 +458,28 @@ nvh264)
 esac
 
 AUDIO_QUEUE_OPTS="queue max-size-buffers=2048 max-size-bytes=0 max-size-time=0"
-VIDEO_QUEUE_OPTS="queue max-size-buffers=12 max-size-bytes=0 max-size-time=0 leaky=downstream"
+# ProjectM needs larger buffers to avoid stalls when processing audio for visualization
+VIDEO_QUEUE_OPTS="queue max-size-buffers=256 max-size-bytes=0 max-size-time=0"
 H264_POST_ENCODE_PIPELINE="h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au"
 
+# Increase GST_DEBUG for ProjectM visualization issues
+export GST_DEBUG="${GST_DEBUG:-3},projectm:5"
+
+echo "Starting GStreamer pipeline..."
+echo "Pipeline: filesrc -> decodebin -> audioconvert/audioresample -> tee"
+echo "  Branch 1 (audio): -> AAC encoder -> muxer"
+echo "  Branch 2 (video): -> ProjectM -> ${ENCODER} encoder -> muxer"
+
 # Run the actual conversion
+# Note: ProjectM requires S16LE audio format, not F32LE
+# We decode audio once, then split: one branch converts to F32LE for AAC, other stays S16LE for ProjectM
 gst-launch-1.0 -e \
   filesrc location=$INPUT_FILE ! \
-    decodebin ! tee name=t \
-      t. ! $AUDIO_QUEUE_OPTS ! audioconvert ! audioresample ! \
-            capsfilter caps="audio/x-raw, format=F32LE, channels=2, rate=44100" ! \
-            avenc_aac bitrate=320000 ! queue ! mux. \
-      t. ! $VIDEO_QUEUE_OPTS ! audioconvert ! projectm \
-            ${PROJECTM_ARGS[@]} ! \
+    decodebin ! audioconvert ! audioresample ! \
+    audio/x-raw,format=S16LE,channels=2,rate=44100 ! \
+    tee name=t \
+      t. ! $AUDIO_QUEUE_OPTS ! audioconvert ! audio/x-raw,format=F32LE ! avenc_aac bitrate=320000 ! queue ! mux. \
+      t. ! $VIDEO_QUEUE_OPTS ! projectm ${PROJECTM_ARGS[@]} ! \
             ${ENCODER_PIPELINE} ! \
             ${H264_POST_ENCODE_PIPELINE} ! queue ! mux. \
     mp4mux name=mux ! filesink location=$OUTPUT_FILE &
