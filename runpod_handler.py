@@ -288,16 +288,27 @@ def _upload_to_s3(file_path: Path, job_id: str) -> str:
         ExtraArgs={"ContentType": "video/mp4"},
     )
 
-    # Generate public URL
+    # Generate presigned URL (works without public bucket access)
+    # URL expires after 24 hours
+    presigned_url_expiration = int(os.environ.get("S3_PRESIGNED_URL_EXPIRATION", "86400"))  # 24 hours default
+
     if public_url_base:
-        # Use custom domain if provided
+        # Use custom domain if provided (assumes public access is configured)
         public_url = f"{public_url_base.rstrip('/')}/{object_key}"
     else:
-        # Use R2 default public URL format
-        # Format: https://pub-<id>.r2.dev/<object_key>
-        # User needs to enable public access on bucket
-        account_id = endpoint_url.split("//")[1].split(".")[0]
-        public_url = f"https://pub-{account_id}.r2.dev/{object_key}"
+        # Generate presigned URL that works without public bucket access
+        try:
+            public_url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket_name, "Key": object_key},
+                ExpiresIn=presigned_url_expiration,
+            )
+            LOGGER.info("Generated presigned URL (expires in %d seconds)", presigned_url_expiration)
+        except Exception as presign_exc:
+            LOGGER.warning("Failed to generate presigned URL: %s, falling back to public URL", presign_exc)
+            # Fallback to public URL format
+            account_id = endpoint_url.split("//")[1].split(".")[0]
+            public_url = f"https://pub-{account_id}.r2.dev/{object_key}"
 
     LOGGER.info("File uploaded successfully: %s", public_url)
     return public_url
