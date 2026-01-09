@@ -205,6 +205,7 @@ def _build_command(
     mesh = str(job_input.get("mesh", os.environ.get("PROJECTM_MESH", "320x240")))
     preset_duration = int(job_input.get("preset_duration", 60))
     encoder_speed = job_input.get("encoder_speed", os.environ.get("PROJECTM_ENCODER_SPEED", "veryfast"))
+    encoder = job_input.get("encoder", os.environ.get("PROJECTM_ENCODER", "auto"))
 
     cmd = [
         "/app/convert.sh",
@@ -226,6 +227,8 @@ def _build_command(
         str(bitrate),
         "--speed",
         str(encoder_speed),
+        "--encoder",
+        encoder,
     ]
 
     if timeline_path is not None:
@@ -291,10 +294,10 @@ def _upload_to_s3(file_path: Path, job_id: str) -> str:
         public_url = f"{public_url_base.rstrip('/')}/{object_key}"
     else:
         # Use R2 default public URL format
-        # Format: https://pub-<id>.r2.dev/<bucket>/<object_key>
+        # Format: https://pub-<id>.r2.dev/<object_key>
         # User needs to enable public access on bucket
         account_id = endpoint_url.split("//")[1].split(".")[0]
-        public_url = f"https://pub-{account_id}.r2.dev/{bucket_name}/{object_key}"
+        public_url = f"https://pub-{account_id}.r2.dev/{object_key}"
 
     LOGGER.info("File uploaded successfully: %s", public_url)
     return public_url

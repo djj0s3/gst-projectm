@@ -72,22 +72,32 @@ start_xvfb() {
     fi
 
     export DISPLAY=:${DISPLAY_NUM}
-    export LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-1}
-    export GALLIUM_DRIVER=${GALLIUM_DRIVER:-llvmpipe}
-    export LIBGL_DRIVERS_PATH=${LIBGL_DRIVERS_PATH:-/usr/lib/x86_64-linux-gnu/dri}
-    export MESA_GL_VERSION_OVERRIDE=${MESA_GL_VERSION_OVERRIDE:-4.5}
-    export MESA_GLSL_VERSION_OVERRIDE=${MESA_GLSL_VERSION_OVERRIDE:-450}
-    # Use GLX instead of X11 for better compatibility with software rendering
-    export GST_GL_PLATFORM=${GST_GL_PLATFORM:-glx}
-    export GST_GL_WINDOW=${GST_GL_WINDOW:-x11}
-    export GST_GL_API=${GST_GL_API:-opengl3}
-    export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    export LIBGL_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+    export MESA_GL_VERSION_OVERRIDE=4.5
+    export MESA_GLSL_VERSION_OVERRIDE=450
+    # CRITICAL: Prevent Xvfb from loading NVIDIA EGL/DRM libraries which cause crashes on GPU systems
+    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+    export __GLX_VENDOR_LIBRARY_NAME=mesa
+    # Disable NVIDIA device enumeration to prevent DRM conflicts
+    export LIBGL_DRI3_DISABLE=1
+    # Use GLX instead of EGL for better compatibility with software rendering
+    export GST_GL_PLATFORM=glx
+    export GST_GL_WINDOW=x11
+    export GST_GL_API=opengl3
+    export GST_GL_CONFIG=rgba
     Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
     XVFB_PID=$!
     echo "Started Xvfb on display :${DISPLAY_NUM} (PID: $XVFB_PID)"
 
-    # Wait for Xvfb to be ready
-    sleep 1
+    # Wait for Xvfb to be ready and verify it started successfully
+    sleep 2
+    if ! kill -0 $XVFB_PID 2>/dev/null; then
+        echo "ERROR: Xvfb failed to start (PID $XVFB_PID is not running)"
+        exit 1
+    fi
+    echo "Xvfb is running"
 }
 
 use_headless_gpu() {
