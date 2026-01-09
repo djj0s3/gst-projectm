@@ -59,7 +59,7 @@ COPY textures /usr/local/share/projectM/textures
 RUN python3 -m venv /opt/runpod-env
 ENV VIRTUAL_ENV=/opt/runpod-env
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-RUN pip install --no-cache-dir runpod requests fastapi uvicorn
+RUN pip install --no-cache-dir runpod requests fastapi uvicorn boto3
 
 # Copy the local gst-projectm source and build the GStreamer plugin
 COPY . /tmp/gst-projectm

@@ -13,6 +13,13 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import requests
 import runpod
 
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
+
 # Default paths bundled inside the container
 DEFAULT_PRESET_DIR = os.environ.get("RUNPOD_PRESET_DIR", "/usr/local/share/projectM/presets")
 DEFAULT_TEXTURE_DIR = os.environ.get("RUNPOD_TEXTURE_DIR", "/usr/local/share/projectM/textures")
@@ -237,6 +244,62 @@ def _tail_text(text: str | None, max_chars: int = LOG_STD_TAIL) -> str:
     return f"...{text[-max_chars:]}"
 
 
+def _upload_to_s3(file_path: Path, job_id: str) -> str:
+    """Upload file to S3-compatible storage and return public URL."""
+    if not S3_AVAILABLE:
+        raise RuntimeError("boto3 not installed - cannot upload to S3")
+
+    # Get S3 configuration from environment
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+    access_key_id = os.environ.get("S3_ACCESS_KEY_ID")
+    secret_access_key = os.environ.get("S3_SECRET_ACCESS_KEY")
+    bucket_name = os.environ.get("S3_BUCKET_NAME")
+    region_name = os.environ.get("S3_REGION_NAME", "auto")  # R2 uses 'auto'
+    public_url_base = os.environ.get("S3_PUBLIC_URL_BASE")  # Optional custom domain
+
+    if not all([endpoint_url, access_key_id, secret_access_key, bucket_name]):
+        raise RuntimeError(
+            "S3 configuration incomplete. Required: S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, "
+            "S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME"
+        )
+
+    # Initialize S3 client
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name=region_name,
+    )
+
+    # Generate object key (filename in bucket)
+    timestamp = int(time.time())
+    object_key = f"videos/{job_id}_{timestamp}.mp4"
+
+    # Upload file
+    LOGGER.info("Uploading %s to S3 bucket %s as %s", file_path, bucket_name, object_key)
+    s3_client.upload_file(
+        str(file_path),
+        bucket_name,
+        object_key,
+        ExtraArgs={"ContentType": "video/mp4"},
+    )
+
+    # Generate public URL
+    if public_url_base:
+        # Use custom domain if provided
+        public_url = f"{public_url_base.rstrip('/')}/{object_key}"
+    else:
+        # Use R2 default public URL format
+        # Format: https://pub-<id>.r2.dev/<object_key>
+        # User needs to enable public access on bucket
+        account_id = endpoint_url.split("//")[1].split(".")[0]
+        public_url = f"https://pub-{account_id}.r2.dev/{object_key}"
+
+    LOGGER.info("File uploaded successfully: %s", public_url)
+    return public_url
+
+
 def handler(job):
     job_id = None
     try:
@@ -379,23 +442,34 @@ def handler(job):
             LOGGER.info("Job %s - video rendered: %.2f MB", job_id or "unknown", file_size_mb)
 
             # Runpod has a ~10MB response size limit for base64-encoded payloads
-            # For files larger than this, we need external storage (S3, R2, etc.)
             MAX_BASE64_MB = 8  # Conservative limit to avoid 400 Bad Request
 
+            # Try S3 upload for large files
             if file_size_mb > MAX_BASE64_MB:
-                error_msg = (
-                    f"Video file ({file_size_mb:.2f} MB) exceeds Runpod's response size limit "
-                    f"({MAX_BASE64_MB} MB). To handle large videos, configure S3-compatible storage "
-                    "(AWS S3, Cloudflare R2, etc.) via environment variables: "
-                    "S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME"
-                )
-                LOGGER.error("Job %s - %s", job_id or "unknown", error_msg)
-                return {
-                    "error": error_msg,
-                    "file_size_mb": round(file_size_mb, 2),
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                }
+                LOGGER.info("Job %s - file too large for base64 (%.2f MB), attempting S3 upload", job_id or "unknown", file_size_mb)
+                try:
+                    video_url = _upload_to_s3(output_path, job_id or "unknown")
+                    LOGGER.info("Job %s - video uploaded to S3: %s", job_id or "unknown", video_url)
+                    return {
+                        "video_url": video_url,
+                        "file_size_mb": round(file_size_mb, 2),
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }
+                except Exception as s3_exc:  # noqa: BLE001
+                    LOGGER.error("Job %s - S3 upload failed: %s", job_id or "unknown", s3_exc)
+                    error_msg = (
+                        f"Video file ({file_size_mb:.2f} MB) exceeds Runpod's response size limit "
+                        f"({MAX_BASE64_MB} MB) and S3 upload failed: {s3_exc}. "
+                        "Please configure S3-compatible storage via environment variables: "
+                        "S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME"
+                    )
+                    return {
+                        "error": error_msg,
+                        "file_size_mb": round(file_size_mb, 2),
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }
 
             # File is small enough - return as base64
             LOGGER.info("Job %s - encoding video as base64 (%.2f MB)", job_id or "unknown", file_size_mb)
