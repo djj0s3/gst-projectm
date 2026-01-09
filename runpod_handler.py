@@ -374,37 +374,40 @@ def handler(job):
                     "stderr": result.stderr,
                 }
 
-            # Upload video to Runpod's CDN instead of base64 encoding
+            # Check output file size
             file_size_mb = output_path.stat().st_size / (1024 * 1024)
-            LOGGER.info("Job %s - uploading video to Runpod CDN (%.2f MB)", job_id or "unknown", file_size_mb)
+            LOGGER.info("Job %s - video rendered: %.2f MB", job_id or "unknown", file_size_mb)
 
-            try:
-                # Upload file using runpod.serverless.upload()
-                video_url = runpod.serverless.upload(str(output_path))
-                LOGGER.info("Job %s - video uploaded successfully: %s", job_id or "unknown", video_url)
+            # Runpod has a ~10MB response size limit for base64-encoded payloads
+            # For files larger than this, we need external storage (S3, R2, etc.)
+            MAX_BASE64_MB = 8  # Conservative limit to avoid 400 Bad Request
 
-                success_result = {
-                    "video_url": video_url,
+            if file_size_mb > MAX_BASE64_MB:
+                error_msg = (
+                    f"Video file ({file_size_mb:.2f} MB) exceeds Runpod's response size limit "
+                    f"({MAX_BASE64_MB} MB). To handle large videos, configure S3-compatible storage "
+                    "(AWS S3, Cloudflare R2, etc.) via environment variables: "
+                    "S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME"
+                )
+                LOGGER.error("Job %s - %s", job_id or "unknown", error_msg)
+                return {
+                    "error": error_msg,
                     "file_size_mb": round(file_size_mb, 2),
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                 }
-                LOGGER.info("Job %s - returning success result with video_url", job_id or "unknown")
-                return success_result
-            except Exception as upload_exc:  # noqa: BLE001
-                LOGGER.error("Job %s - failed to upload video to Runpod CDN: %s", job_id or "unknown", upload_exc)
-                # Fallback to base64 if upload fails
-                LOGGER.info("Job %s - falling back to base64 encoding", job_id or "unknown")
-                output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
-                fallback_result = {
-                    "base_video_b64": output_b64,
-                    "file_size_mb": round(file_size_mb, 2),
-                    "upload_error": str(upload_exc),
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                }
-                LOGGER.info("Job %s - returning fallback result with base64", job_id or "unknown")
-                return fallback_result
+
+            # File is small enough - return as base64
+            LOGGER.info("Job %s - encoding video as base64 (%.2f MB)", job_id or "unknown", file_size_mb)
+            output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
+            success_result = {
+                "base_video_b64": output_b64,
+                "file_size_mb": round(file_size_mb, 2),
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+            LOGGER.info("Job %s - returning success result with base64", job_id or "unknown")
+            return success_result
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Job %s - handler crashed", job_id or "unknown")
         error_result = {"error": f"RunPod handler crashed: {exc}"}
