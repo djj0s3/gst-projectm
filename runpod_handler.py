@@ -291,10 +291,10 @@ def _upload_to_s3(file_path: Path, job_id: str) -> str:
         public_url = f"{public_url_base.rstrip('/')}/{object_key}"
     else:
         # Use R2 default public URL format
-        # Format: https://pub-<id>.r2.dev/<object_key>
+        # Format: https://pub-<id>.r2.dev/<bucket>/<object_key>
         # User needs to enable public access on bucket
         account_id = endpoint_url.split("//")[1].split(".")[0]
-        public_url = f"https://pub-{account_id}.r2.dev/{object_key}"
+        public_url = f"https://pub-{account_id}.r2.dev/{bucket_name}/{object_key}"
 
     LOGGER.info("File uploaded successfully: %s", public_url)
     return public_url
@@ -441,46 +441,30 @@ def handler(job):
             file_size_mb = output_path.stat().st_size / (1024 * 1024)
             LOGGER.info("Job %s - video rendered: %.2f MB", job_id or "unknown", file_size_mb)
 
-            # Runpod has a ~10MB response size limit for base64-encoded payloads
-            MAX_BASE64_MB = 8  # Conservative limit to avoid 400 Bad Request
+            # Always upload to S3-compatible storage (Cloudflare R2) and return a CDN URL
+            LOGGER.info("Job %s - uploading %.2f MB video to S3-compatible storage", job_id or "unknown", file_size_mb)
+            try:
+                video_url = _upload_to_s3(output_path, job_id or "unknown")
+            except Exception as s3_exc:  # noqa: BLE001
+                LOGGER.error("Job %s - failed to upload video to S3: %s", job_id or "unknown", s3_exc)
+                error_msg = (
+                    f"Video rendered ({file_size_mb:.2f} MB) but uploading to S3-compatible storage failed: {s3_exc}. "
+                    "Ensure S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, and S3_BUCKET_NAME are configured."
+                )
+                return {
+                    "error": error_msg,
+                    "file_size_mb": round(file_size_mb, 2),
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
 
-            # Try S3 upload for large files
-            if file_size_mb > MAX_BASE64_MB:
-                LOGGER.info("Job %s - file too large for base64 (%.2f MB), attempting S3 upload", job_id or "unknown", file_size_mb)
-                try:
-                    video_url = _upload_to_s3(output_path, job_id or "unknown")
-                    LOGGER.info("Job %s - video uploaded to S3: %s", job_id or "unknown", video_url)
-                    return {
-                        "video_url": video_url,
-                        "file_size_mb": round(file_size_mb, 2),
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                    }
-                except Exception as s3_exc:  # noqa: BLE001
-                    LOGGER.error("Job %s - S3 upload failed: %s", job_id or "unknown", s3_exc)
-                    error_msg = (
-                        f"Video file ({file_size_mb:.2f} MB) exceeds Runpod's response size limit "
-                        f"({MAX_BASE64_MB} MB) and S3 upload failed: {s3_exc}. "
-                        "Please configure S3-compatible storage via environment variables: "
-                        "S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME"
-                    )
-                    return {
-                        "error": error_msg,
-                        "file_size_mb": round(file_size_mb, 2),
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                    }
-
-            # File is small enough - return as base64
-            LOGGER.info("Job %s - encoding video as base64 (%.2f MB)", job_id or "unknown", file_size_mb)
-            output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
             success_result = {
-                "base_video_b64": output_b64,
+                "video_url": video_url,
                 "file_size_mb": round(file_size_mb, 2),
                 "stdout": result.stdout,
                 "stderr": result.stderr,
             }
-            LOGGER.info("Job %s - returning success result with base64", job_id or "unknown")
+            LOGGER.info("Job %s - returning success result with uploaded video URL %s", job_id or "unknown", video_url)
             return success_result
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Job %s - handler crashed", job_id or "unknown")
