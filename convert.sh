@@ -439,9 +439,10 @@ PROJECTM_ARGS+=("mesh-size=${MESH_X},${MESH_Y}")
 KEY_INT=$((FRAMERATE * 2))
 GL_DOWNLOAD_PIPELINE=""
 if [ "$use_gpu" -eq 1 ] || [ "$FORCE_GL_DOWNLOAD" -eq 1 ]; then
-    # ProjectM outputs ABGR in GL memory, download to system memory without format caps
-    # Let glcolorconvert and videoconvert handle format conversion automatically
-    GL_DOWNLOAD_PIPELINE="glcolorconvert ! gldownload ! "
+    # ProjectM outputs GL textures, download to system memory for encoding
+    # Skip glcolorconvert with EGL headless as it can't negotiate context
+    # Let videoconvert handle any needed format conversion after gldownload
+    GL_DOWNLOAD_PIPELINE="gldownload ! "
 fi
 case "$ENCODER" in
     x264)
