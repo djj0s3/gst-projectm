@@ -243,13 +243,16 @@ def handler(job):
         if isinstance(job, dict):
             job_id = job.get("id")
         LOGGER.info("Received RunPod request%s", f" {job_id}" if job_id else "")
+        LOGGER.info("Job input: %s", job)
 
         input_payload = job.get("input") or {}
         audio_b64 = input_payload.get("audio_b64")
         audio_url = input_payload.get("audio_url")
         if not audio_b64 and not audio_url:
             LOGGER.error("Job %s missing audio_b64/audio_url input", job_id or "unknown")
-            return {"error": "Missing audio_b64 or audio_url in payload"}
+            error_result = {"error": "Missing audio_b64 or audio_url in payload"}
+            LOGGER.error("Job %s - returning error: %s", job_id or "unknown", error_result)
+            return error_result
 
         audio_name = input_payload.get("audio_filename") or "input_audio"
         suffix = Path(audio_name).suffix or ".mp3"
@@ -277,7 +280,9 @@ def handler(job):
                     _download_from_url(audio_url, audio_path)
                 except ConversionError as exc:
                     LOGGER.error("Job %s - download failed: %s", job_id or "unknown", exc)
-                    return {"error": f"Remote download failed: {exc}"}
+                    error_result = {"error": f"Remote download failed: {exc}"}
+                    LOGGER.error("Job %s - returning error: %s", job_id or "unknown", error_result)
+                    return error_result
                 LOGGER.info("Job %s - download complete (%d bytes)", job_id or "unknown", audio_path.stat().st_size)
 
             timeline_path = None
@@ -378,27 +383,33 @@ def handler(job):
                 video_url = runpod.upload_file(str(output_path))
                 LOGGER.info("Job %s - video uploaded successfully: %s", job_id or "unknown", video_url)
 
-                return {
+                success_result = {
                     "video_url": video_url,
                     "file_size_mb": round(file_size_mb, 2),
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                 }
+                LOGGER.info("Job %s - returning success result with video_url", job_id or "unknown")
+                return success_result
             except Exception as upload_exc:  # noqa: BLE001
                 LOGGER.error("Job %s - failed to upload video to Runpod CDN: %s", job_id or "unknown", upload_exc)
                 # Fallback to base64 if upload fails
                 LOGGER.info("Job %s - falling back to base64 encoding", job_id or "unknown")
                 output_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
-                return {
+                fallback_result = {
                     "base_video_b64": output_b64,
                     "file_size_mb": round(file_size_mb, 2),
                     "upload_error": str(upload_exc),
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                 }
+                LOGGER.info("Job %s - returning fallback result with base64", job_id or "unknown")
+                return fallback_result
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Job %s - handler crashed", job_id or "unknown")
-        return {"error": f"RunPod handler crashed: {exc}"}
+        error_result = {"error": f"RunPod handler crashed: {exc}"}
+        LOGGER.error("Job %s - returning error result: %s", job_id or "unknown", error_result)
+        return error_result
 
 
 if __name__ == "__main__":
