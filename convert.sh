@@ -59,6 +59,8 @@ gpu_accessible() {
 }
 
 start_xvfb() {
+    echo "Starting Xvfb (software rendering fallback)..."
+
     # Use unique display number based on process ID to avoid conflicts
     DISPLAY_NUM=$((99 + ($$  % 100)))
     X_LOCK_FILE="/tmp/.X${DISPLAY_NUM}-lock"
@@ -71,34 +73,22 @@ start_xvfb() {
 
     export DISPLAY=:${DISPLAY_NUM}
 
-    # Configure rendering backend based on GPU availability
-    if [ "$use_gpu" -eq 1 ]; then
-        echo "Starting Xvfb with GPU acceleration..."
-        # Allow GPU to be used for OpenGL rendering
-        # Don't force software rendering
-        export GST_GL_PLATFORM=glx
-        export GST_GL_WINDOW=x11
-        export GST_GL_API=opengl3
-        export GST_GL_CONFIG=rgba
-    else
-        echo "Starting Xvfb (software rendering fallback)..."
-        # Force Mesa software rendering
-        export LIBGL_ALWAYS_SOFTWARE=1
-        export GALLIUM_DRIVER=llvmpipe
-        export LIBGL_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
-        export MESA_GL_VERSION_OVERRIDE=4.5
-        export MESA_GLSL_VERSION_OVERRIDE=450
-        # CRITICAL: Prevent Xvfb from loading NVIDIA EGL/DRM libraries which cause crashes on GPU systems
-        export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
-        export __GLX_VENDOR_LIBRARY_NAME=mesa
-        # Disable NVIDIA device enumeration to prevent DRM conflicts
-        export LIBGL_DRI3_DISABLE=1
-        # Use GLX for software rendering
-        export GST_GL_PLATFORM=glx
-        export GST_GL_WINDOW=x11
-        export GST_GL_API=opengl3
-        export GST_GL_CONFIG=rgba
-    fi
+    # Force Mesa software rendering
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    export LIBGL_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+    export MESA_GL_VERSION_OVERRIDE=4.5
+    export MESA_GLSL_VERSION_OVERRIDE=450
+    # CRITICAL: Prevent Xvfb from loading NVIDIA EGL/DRM libraries which cause crashes on GPU systems
+    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+    export __GLX_VENDOR_LIBRARY_NAME=mesa
+    # Disable NVIDIA device enumeration to prevent DRM conflicts
+    export LIBGL_DRI3_DISABLE=1
+    # Use GLX for software rendering
+    export GST_GL_PLATFORM=glx
+    export GST_GL_WINDOW=x11
+    export GST_GL_API=opengl3
+    export GST_GL_CONFIG=rgba
 
     Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
     XVFB_PID=$!
@@ -328,19 +318,23 @@ if [ "$FORCE_XVFB" -eq 1 ] && [ "$FORCE_GPU" -eq 1 ]; then
 fi
 
 # Decide rendering backend
-# We use Xvfb for ProjectM rendering (GL context works better with X11 than headless EGL)
-# But Xvfb can still use the GPU for OpenGL acceleration
 has_hw_encoder=0
 use_gpu=0
 
 if has_gpu && gpu_accessible; then
     has_hw_encoder=1
     use_gpu=1
-    echo "GPU detected and accessible - enabling for rendering and encoding"
+    echo "GPU detected and accessible - enabling EGL headless rendering"
 fi
 
-# Start Xvfb for ProjectM (will use GPU if available)
-start_xvfb
+# Select rendering backend based on GPU availability
+if [ "$use_gpu" -eq 1 ]; then
+    # Use EGL headless for GPU-accelerated ProjectM rendering
+    use_headless_gpu
+else
+    # Fallback to Xvfb software rendering when no GPU
+    start_xvfb
+fi
 
 # Select encoder based on GPU availability
 select_best_encoder
