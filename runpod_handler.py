@@ -379,8 +379,8 @@ def handler(job):
             LOGGER.info("Job %s - uploading video to Runpod CDN (%.2f MB)", job_id or "unknown", file_size_mb)
 
             try:
-                # Upload file using runpod.upload_file()
-                video_url = runpod.upload_file(str(output_path))
+                # Upload file using runpod.serverless.upload()
+                video_url = runpod.serverless.upload(str(output_path))
                 LOGGER.info("Job %s - video uploaded successfully: %s", job_id or "unknown", video_url)
 
                 success_result = {
