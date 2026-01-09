@@ -475,7 +475,17 @@ EXIT_CODE=$?
 # Clean up Xvfb before exiting
 if [ ! -z "$XVFB_PID" ]; then
     kill -TERM $XVFB_PID 2>/dev/null || true
-    # Don't wait for Xvfb to avoid blocking
+    # Wait for Xvfb to exit (with timeout)
+    XVFB_WAIT=0
+    while kill -0 $XVFB_PID 2>/dev/null && [ $XVFB_WAIT -lt 10 ]; do
+        sleep 0.5
+        XVFB_WAIT=$((XVFB_WAIT + 1))
+    done
+    # Force kill if still running
+    if kill -0 $XVFB_PID 2>/dev/null; then
+        kill -KILL $XVFB_PID 2>/dev/null || true
+        wait $XVFB_PID 2>/dev/null || true
+    fi
 fi
 
 if [ $EXIT_CODE -eq 0 ]; then
