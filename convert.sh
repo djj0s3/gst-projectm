@@ -79,24 +79,16 @@ start_nvidia_xorg() {
     export GST_GL_API=opengl3
     export GST_GL_CONFIG=rgba
 
-    # Generate xorg.conf if it doesn't exist
-    if [ ! -f /etc/X11/xorg.conf ]; then
-        echo "Generating xorg.conf for headless NVIDIA rendering..."
-        nvidia-xconfig -a \
-            --allow-empty-initial-configuration \
-            --virtual=${VIDEO_WIDTH}x${VIDEO_HEIGHT} \
-            --depth=24 \
-            --silent 2>/dev/null || echo "nvidia-xconfig not available, using default config"
-    fi
-
-    # Start X server with NVIDIA driver
+    # Start X server with NVIDIA driver using our pre-configured xorg.conf
+    echo "Using xorg.conf for NVIDIA driver"
     Xorg :${DISPLAY_NUM} \
         -config /etc/X11/xorg.conf \
         -noreset \
         +extension GLX \
         +extension RANDR \
         +extension RENDER \
-        -nolisten tcp &
+        -nolisten tcp \
+        -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
     XORG_PID=$!
     echo "Started NVIDIA X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
 
@@ -104,6 +96,9 @@ start_nvidia_xorg() {
     sleep 3
     if ! kill -0 $XORG_PID 2>/dev/null; then
         echo "ERROR: X server failed to start (PID $XORG_PID is not running)"
+        echo "--- X server log ---"
+        cat /tmp/Xorg.${DISPLAY_NUM}.log 2>/dev/null || echo "No log file found"
+        echo "--- end X server log ---"
         exit 1
     fi
 
