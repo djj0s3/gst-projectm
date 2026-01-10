@@ -58,8 +58,8 @@ gpu_accessible() {
     return 1
 }
 
-start_nvidia_xorg() {
-    echo "Starting NVIDIA X server for GPU-accelerated rendering..."
+start_x_with_gpu() {
+    echo "Starting X server with dummy driver + GPU EGL rendering..."
 
     # Use unique display number based on process ID to avoid conflicts
     DISPLAY_NUM=$((99 + ($$  % 100)))
@@ -73,14 +73,19 @@ start_nvidia_xorg() {
 
     export DISPLAY=:${DISPLAY_NUM}
 
-    # Use NVIDIA GLX libraries for hardware acceleration
-    export GST_GL_PLATFORM=glx
+    # CRITICAL: Use EGL for GPU rendering, not GLX
+    # X server uses dummy driver (CPU), but GStreamer uses EGL (GPU)
+    export GST_GL_PLATFORM=egl
     export GST_GL_WINDOW=x11
     export GST_GL_API=opengl3
     export GST_GL_CONFIG=rgba
 
-    # Start X server with NVIDIA driver using our pre-configured xorg.conf
-    echo "Using xorg.conf for NVIDIA driver"
+    # Enable NVIDIA EGL for GStreamer
+    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+    export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+    # Start X server with dummy driver (provides display for ProjectM window)
+    echo "Starting X server with dummy driver..."
     Xorg :${DISPLAY_NUM} \
         -config /etc/X11/xorg.conf \
         -noreset \
@@ -90,10 +95,10 @@ start_nvidia_xorg() {
         -nolisten tcp \
         -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
     XORG_PID=$!
-    echo "Started NVIDIA X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
+    echo "Started X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
 
     # Wait for X server to be ready
-    sleep 3
+    sleep 2
     if ! kill -0 $XORG_PID 2>/dev/null; then
         echo "ERROR: X server failed to start (PID $XORG_PID is not running)"
         echo "--- X server log ---"
@@ -102,13 +107,7 @@ start_nvidia_xorg() {
         exit 1
     fi
 
-    # Verify GPU is being used
-    if command -v glxinfo >/dev/null 2>&1; then
-        RENDERER=$(DISPLAY=:${DISPLAY_NUM} glxinfo 2>/dev/null | grep "OpenGL renderer" | head -n1)
-        echo "OpenGL Renderer: $RENDERER"
-    fi
-
-    echo "NVIDIA X server is running with GPU acceleration"
+    echo "X server running (dummy driver for display, EGL for GPU rendering)"
 }
 
 start_xvfb_fallback() {
@@ -377,8 +376,8 @@ fi
 
 # Select X server based on GPU availability
 if [ "$use_gpu" -eq 1 ]; then
-    # Use real X server with NVIDIA driver for GPU acceleration
-    start_nvidia_xorg
+    # Use X server with dummy driver + EGL for GPU acceleration
+    start_x_with_gpu
 else
     # Fallback to Xvfb software rendering when no GPU
     start_xvfb_fallback
