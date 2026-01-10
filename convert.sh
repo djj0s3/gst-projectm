@@ -546,11 +546,38 @@ echo "Conversion running. Press Ctrl+C to stop."
 # Calculate max duration (audio duration * 4 + 120 seconds buffer)
 MAX_DURATION=7200  # 2 hours max fallback
 
-# Wait with timeout monitoring
+# Wait with timeout monitoring and check output file size
 WAIT_COUNT=0
+LAST_SIZE=0
+STALL_COUNT=0
 while kill -0 $GST_PID 2>/dev/null; do
     sleep 5
     WAIT_COUNT=$((WAIT_COUNT + 5))
+
+    # Check if output file is growing
+    if [ -f "$OUTPUT_FILE" ]; then
+        CURRENT_SIZE=$(stat -f%z "$OUTPUT_FILE" 2>/dev/null || stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo "0")
+        if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
+            STALL_COUNT=$((STALL_COUNT + 5))
+            # If file hasn't grown in 30 seconds, assume pipeline is stuck
+            if [ $STALL_COUNT -gt 30 ]; then
+                echo "⚠️  Output file hasn't grown in ${STALL_COUNT}s (${CURRENT_SIZE} bytes), sending EOS"
+                kill -INT $GST_PID 2>/dev/null || true
+                sleep 5
+                # If still running after EOS, force terminate
+                if kill -0 $GST_PID 2>/dev/null; then
+                    echo "⚠️  Pipeline didn't respond to EOS, force terminating"
+                    kill -TERM $GST_PID 2>/dev/null || true
+                    sleep 2
+                    kill -KILL $GST_PID 2>/dev/null || true
+                fi
+                break
+            fi
+        else
+            STALL_COUNT=0
+        fi
+        LAST_SIZE=$CURRENT_SIZE
+    fi
 
     # Hard timeout
     if [ $WAIT_COUNT -gt $MAX_DURATION ]; then
