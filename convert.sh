@@ -550,15 +550,17 @@ MAX_DURATION=7200  # 2 hours max fallback
 WAIT_COUNT=0
 LAST_SIZE=0
 STALL_COUNT=0
+echo "Monitoring pipeline (PID $GST_PID)..."
 while kill -0 $GST_PID 2>/dev/null; do
     sleep 5
     WAIT_COUNT=$((WAIT_COUNT + 5))
 
     # Check if output file is growing
     if [ -f "$OUTPUT_FILE" ]; then
-        CURRENT_SIZE=$(stat -f%z "$OUTPUT_FILE" 2>/dev/null || stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo "0")
-        if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
+        CURRENT_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo "0")
+        if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ] && [ "$CURRENT_SIZE" -gt 0 ]; then
             STALL_COUNT=$((STALL_COUNT + 5))
+            echo "[${WAIT_COUNT}s] Output stalled at ${CURRENT_SIZE} bytes for ${STALL_COUNT}s"
             # If file hasn't grown in 30 seconds, assume pipeline is stuck
             if [ $STALL_COUNT -gt 30 ]; then
                 echo "⚠️  Output file hasn't grown in ${STALL_COUNT}s (${CURRENT_SIZE} bytes), sending EOS"
@@ -574,9 +576,14 @@ while kill -0 $GST_PID 2>/dev/null; do
                 break
             fi
         else
+            if [ $STALL_COUNT -gt 0 ]; then
+                echo "[${WAIT_COUNT}s] Output growing: ${CURRENT_SIZE} bytes (was stalled for ${STALL_COUNT}s)"
+            fi
             STALL_COUNT=0
         fi
         LAST_SIZE=$CURRENT_SIZE
+    else
+        echo "[${WAIT_COUNT}s] Waiting for output file to be created..."
     fi
 
     # Hard timeout
@@ -589,6 +596,7 @@ while kill -0 $GST_PID 2>/dev/null; do
     fi
 done
 
+echo "Pipeline process exited, checking result..."
 # Check if conversion completed successfully
 wait $GST_PID
 EXIT_CODE=$?
