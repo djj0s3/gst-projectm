@@ -58,8 +58,66 @@ gpu_accessible() {
     return 1
 }
 
-start_xvfb() {
-    echo "Starting Xvfb (software rendering fallback)..."
+start_nvidia_xorg() {
+    echo "Starting NVIDIA X server for GPU-accelerated rendering..."
+
+    # Use unique display number based on process ID to avoid conflicts
+    DISPLAY_NUM=$((99 + ($$  % 100)))
+    X_LOCK_FILE="/tmp/.X${DISPLAY_NUM}-lock"
+
+    # Clean up stale X lock file if present
+    if [ -f "$X_LOCK_FILE" ]; then
+        echo "Removing stale X lock file..."
+        rm -f "$X_LOCK_FILE"
+    fi
+
+    export DISPLAY=:${DISPLAY_NUM}
+
+    # Use NVIDIA GLX libraries for hardware acceleration
+    export GST_GL_PLATFORM=glx
+    export GST_GL_WINDOW=x11
+    export GST_GL_API=opengl3
+    export GST_GL_CONFIG=rgba
+
+    # Generate xorg.conf if it doesn't exist
+    if [ ! -f /etc/X11/xorg.conf ]; then
+        echo "Generating xorg.conf for headless NVIDIA rendering..."
+        nvidia-xconfig -a \
+            --allow-empty-initial-configuration \
+            --virtual=${VIDEO_WIDTH}x${VIDEO_HEIGHT} \
+            --depth=24 \
+            --silent 2>/dev/null || echo "nvidia-xconfig not available, using default config"
+    fi
+
+    # Start X server with NVIDIA driver
+    Xorg :${DISPLAY_NUM} \
+        -config /etc/X11/xorg.conf \
+        -noreset \
+        +extension GLX \
+        +extension RANDR \
+        +extension RENDER \
+        -nolisten tcp &
+    XORG_PID=$!
+    echo "Started NVIDIA X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
+
+    # Wait for X server to be ready
+    sleep 3
+    if ! kill -0 $XORG_PID 2>/dev/null; then
+        echo "ERROR: X server failed to start (PID $XORG_PID is not running)"
+        exit 1
+    fi
+
+    # Verify GPU is being used
+    if command -v glxinfo >/dev/null 2>&1; then
+        RENDERER=$(DISPLAY=:${DISPLAY_NUM} glxinfo 2>/dev/null | grep "OpenGL renderer" | head -n1)
+        echo "OpenGL Renderer: $RENDERER"
+    fi
+
+    echo "NVIDIA X server is running with GPU acceleration"
+}
+
+start_xvfb_fallback() {
+    echo "Starting Xvfb (CPU software rendering fallback)..."
 
     # Use unique display number based on process ID to avoid conflicts
     DISPLAY_NUM=$((99 + ($$  % 100)))
@@ -79,11 +137,6 @@ start_xvfb() {
     export LIBGL_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
     export MESA_GL_VERSION_OVERRIDE=4.5
     export MESA_GLSL_VERSION_OVERRIDE=450
-    # CRITICAL: Prevent Xvfb from loading NVIDIA EGL/DRM libraries which cause crashes on GPU systems
-    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
-    export __GLX_VENDOR_LIBRARY_NAME=mesa
-    # Disable NVIDIA device enumeration to prevent DRM conflicts
-    export LIBGL_DRI3_DISABLE=1
     # Use GLX for software rendering
     export GST_GL_PLATFORM=glx
     export GST_GL_WINDOW=x11
@@ -100,7 +153,7 @@ start_xvfb() {
         echo "ERROR: Xvfb failed to start (PID $XVFB_PID is not running)"
         exit 1
     fi
-    echo "Xvfb is running"
+    echo "Xvfb is running (CPU-only)"
 }
 
 use_headless_gpu() {
@@ -324,16 +377,16 @@ use_gpu=0
 if has_gpu && gpu_accessible; then
     has_hw_encoder=1
     use_gpu=1
-    echo "GPU detected and accessible - enabling EGL headless rendering"
+    echo "GPU detected and accessible - enabling GPU rendering"
 fi
 
-# Select rendering backend based on GPU availability
+# Select X server based on GPU availability
 if [ "$use_gpu" -eq 1 ]; then
-    # Use EGL headless for GPU-accelerated ProjectM rendering
-    use_headless_gpu
+    # Use real X server with NVIDIA driver for GPU acceleration
+    start_nvidia_xorg
 else
     # Fallback to Xvfb software rendering when no GPU
-    start_xvfb
+    start_xvfb_fallback
 fi
 
 # Select encoder based on GPU availability

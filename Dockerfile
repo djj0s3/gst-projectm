@@ -15,6 +15,10 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
         libssl-dev \
         curl \
         xvfb \
+        xserver-xorg-core \
+        xserver-xorg-video-dummy \
+        x11-xserver-utils \
+        kmod \
         libgstreamer-plugins-base1.0-dev \
         libgstreamer-plugins-bad1.0-dev \
         gstreamer1.0-plugins-base \
