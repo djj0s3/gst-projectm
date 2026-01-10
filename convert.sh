@@ -59,7 +59,7 @@ gpu_accessible() {
 }
 
 start_x_with_gpu() {
-    echo "Starting X server with dummy driver + GPU EGL rendering..."
+    echo "Starting X server with dummy driver + GLX rendering..."
 
     # Use unique display number based on process ID to avoid conflicts
     DISPLAY_NUM=$((99 + ($$  % 100)))
@@ -73,18 +73,17 @@ start_x_with_gpu() {
 
     export DISPLAY=:${DISPLAY_NUM}
 
-    # CRITICAL: Use EGL for GPU rendering, not GLX
-    # X server uses dummy driver (CPU), but GStreamer uses EGL (GPU)
-    export GST_GL_PLATFORM=egl
+    # Use GLX through X server (works with dummy driver via Mesa)
+    export GST_GL_PLATFORM=glx
     export GST_GL_WINDOW=x11
     export GST_GL_API=opengl3
     export GST_GL_CONFIG=rgba
 
-    # Enable NVIDIA EGL for GStreamer
-    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-    export __GLX_VENDOR_LIBRARY_NAME=nvidia
+    # Allow software rendering via Mesa for GL contexts
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
 
-    # Start X server with dummy driver (provides display for ProjectM window)
+    # Start X server with dummy driver (provides display + GLX for ProjectM)
     echo "Starting X server with dummy driver..."
     Xorg :${DISPLAY_NUM} \
         -config /etc/X11/xorg.conf \
@@ -107,7 +106,7 @@ start_x_with_gpu() {
         exit 1
     fi
 
-    echo "X server running (dummy driver for display, EGL for GPU rendering)"
+    echo "X server running with GLX (ProjectM uses Mesa software GL, encoder uses GPU)"
 }
 
 start_xvfb_fallback() {
