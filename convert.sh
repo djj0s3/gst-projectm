@@ -19,9 +19,10 @@ FORCE_XVFB=0
 FORCE_GL_DOWNLOAD=${FORCE_GL_DOWNLOAD:-0}
 MESH_CUSTOM=0
 
-# Process IDs for the gst-launch process and Xvfb
+# Process IDs for the gst-launch process and X servers
 GST_PID=""
 XVFB_PID=""
+XORG_PID=""
 
 has_gpu() {
     if command -v nvidia-smi >/dev/null 2>&1; then
@@ -79,12 +80,13 @@ start_x_with_gpu() {
     export GST_GL_API=opengl3
     export GST_GL_CONFIG=rgba
 
-    # Allow software rendering via Mesa for GL contexts
-    export LIBGL_ALWAYS_SOFTWARE=1
-    export GALLIUM_DRIVER=llvmpipe
-
     # Start X server with dummy driver (provides display + GLX for ProjectM)
-    echo "Starting X server with dummy driver..."
+    # Force Mesa software rendering for X server only to prevent NVIDIA library conflicts
+    echo "Starting X server with dummy driver and Mesa software rendering..."
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    GALLIUM_DRIVER=llvmpipe \
+    __GLX_VENDOR_LIBRARY_NAME=mesa \
+    __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
     Xorg :${DISPLAY_NUM} \
         -config /etc/X11/xorg.conf \
         -noreset \
@@ -234,6 +236,11 @@ cleanup() {
         wait $XVFB_PID 2>/dev/null || true
     fi
 
+    if [ ! -z "$XORG_PID" ]; then
+        kill -TERM $XORG_PID 2>/dev/null || true
+        wait $XORG_PID 2>/dev/null || true
+    fi
+
     exit 0
 }
 
@@ -297,15 +304,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --mesh)
             MESH_SIZE="$2"
-            MESH_X=$(echo $MESH_SIZE | cut -d'x' -f1)
-            MESH_Y=$(echo $MESH_SIZE | cut -d'x' -f2)
+            MESH_X=$(echo "$MESH_SIZE" | cut -d'x' -f1)
+            MESH_Y=$(echo "$MESH_SIZE" | cut -d'x' -f2)
             MESH_CUSTOM=1
             shift 2
             ;;
         --video-size)
             VIDEO_SIZE="$2"
-            VIDEO_WIDTH=$(echo $VIDEO_SIZE | cut -d'x' -f1)
-            VIDEO_HEIGHT=$(echo $VIDEO_SIZE | cut -d'x' -f2)
+            VIDEO_WIDTH=$(echo "$VIDEO_SIZE" | cut -d'x' -f1)
+            VIDEO_HEIGHT=$(echo "$VIDEO_SIZE" | cut -d'x' -f2)
             shift 2
             ;;
         -r|--framerate)
@@ -519,6 +526,10 @@ H264_POST_ENCODE_PIPELINE="h264parse config-interval=-1 ! video/x-h264,stream-fo
 # Increase GST_DEBUG for ProjectM visualization issues
 export GST_DEBUG="${GST_DEBUG:-3},projectm:5"
 
+# Ensure output directory exists
+OUTPUT_DIR=$(dirname "$OUTPUT_FILE")
+mkdir -p "$OUTPUT_DIR"
+
 echo "Starting GStreamer pipeline..."
 echo "Pipeline: filesrc -> decodebin -> audioconvert/audioresample -> tee"
 echo "  Branch 1 (audio): -> AAC encoder -> muxer"
@@ -528,7 +539,7 @@ echo "  Branch 2 (video): -> ProjectM -> ${ENCODER} encoder -> muxer"
 # Note: ProjectM requires S16LE audio format, not F32LE
 # We decode audio once, then split: one branch converts to F32LE for AAC, other stays S16LE for ProjectM
 gst-launch-1.0 -e \
-  filesrc location=$INPUT_FILE ! \
+  filesrc location="$INPUT_FILE" ! \
     decodebin ! audioconvert ! audioresample ! \
     audio/x-raw,format=S16LE,channels=2,rate=44100 ! \
     tee name=t \
@@ -536,7 +547,7 @@ gst-launch-1.0 -e \
       t. ! $VIDEO_QUEUE_OPTS ! projectm ${PROJECTM_ARGS[@]} ! \
             ${ENCODER_PIPELINE} ! \
             ${H264_POST_ENCODE_PIPELINE} ! queue ! mux. \
-    mp4mux name=mux ! filesink location=$OUTPUT_FILE &
+    mp4mux name=mux ! filesink location="$OUTPUT_FILE" &
 
 GST_PID=$!
 
@@ -601,7 +612,7 @@ echo "Pipeline process exited, checking result..."
 wait $GST_PID
 EXIT_CODE=$?
 
-# Clean up Xvfb before exiting
+# Clean up X server before exiting
 if [ ! -z "$XVFB_PID" ]; then
     kill -TERM $XVFB_PID 2>/dev/null || true
     # Wait for Xvfb to exit (with timeout)
@@ -614,6 +625,21 @@ if [ ! -z "$XVFB_PID" ]; then
     if kill -0 $XVFB_PID 2>/dev/null; then
         kill -KILL $XVFB_PID 2>/dev/null || true
         wait $XVFB_PID 2>/dev/null || true
+    fi
+fi
+
+if [ ! -z "$XORG_PID" ]; then
+    kill -TERM $XORG_PID 2>/dev/null || true
+    # Wait for Xorg to exit (with timeout)
+    XORG_WAIT=0
+    while kill -0 $XORG_PID 2>/dev/null && [ $XORG_WAIT -lt 10 ]; do
+        sleep 0.5
+        XORG_WAIT=$((XORG_WAIT + 1))
+    done
+    # Force kill if still running
+    if kill -0 $XORG_PID 2>/dev/null; then
+        kill -KILL $XORG_PID 2>/dev/null || true
+        wait $XORG_PID 2>/dev/null || true
     fi
 fi
 
