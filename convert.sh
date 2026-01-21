@@ -60,8 +60,6 @@ gpu_accessible() {
 }
 
 start_x_with_gpu() {
-    echo "Starting X server with dummy driver + GLX rendering..."
-
     # Use unique display number based on process ID to avoid conflicts
     DISPLAY_NUM=$((99 + ($$  % 100)))
     X_LOCK_FILE="/tmp/.X${DISPLAY_NUM}-lock"
@@ -74,27 +72,47 @@ start_x_with_gpu() {
 
     export DISPLAY=:${DISPLAY_NUM}
 
-    # Use GLX through X server (works with dummy driver via Mesa)
+    # Use GLX through X server
     export GST_GL_PLATFORM=glx
     export GST_GL_WINDOW=x11
     export GST_GL_API=opengl3
     export GST_GL_CONFIG=rgba
 
-    # Start X server with dummy driver (provides display + GLX for ProjectM)
-    # Force Mesa software rendering for X server only to prevent NVIDIA library conflicts
-    echo "Starting X server with dummy driver and Mesa software rendering..."
-    LIBGL_ALWAYS_SOFTWARE=1 \
-    GALLIUM_DRIVER=llvmpipe \
-    __GLX_VENDOR_LIBRARY_NAME=mesa \
-    __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
-    Xorg :${DISPLAY_NUM} \
-        -config /etc/X11/xorg.conf \
-        -noreset \
-        +extension GLX \
-        +extension RANDR \
-        +extension RENDER \
-        -nolisten tcp \
-        -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
+    # Check if we should use NVIDIA GPU rendering (set USE_NVIDIA_GPU=1 for pods)
+    if [ "${USE_NVIDIA_GPU:-0}" -eq 1 ]; then
+        echo "Starting X server with NVIDIA driver for GPU-accelerated rendering..."
+        # Use NVIDIA driver with full GPU acceleration
+        XORG_CONF="/etc/X11/xorg-nvidia.conf"
+        RENDER_MODE="NVIDIA GPU"
+        # No Mesa forcing - use native NVIDIA libraries
+        Xorg :${DISPLAY_NUM} \
+            -config "$XORG_CONF" \
+            -noreset \
+            +extension GLX \
+            +extension RANDR \
+            +extension RENDER \
+            -nolisten tcp \
+            -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
+    else
+        echo "Starting X server with dummy driver and Mesa software rendering..."
+        # Use dummy driver with Mesa software rendering (v35 stable fallback)
+        XORG_CONF="/etc/X11/xorg.conf"
+        RENDER_MODE="Mesa software GL"
+        # Force Mesa software rendering for X server only to prevent NVIDIA library conflicts
+        LIBGL_ALWAYS_SOFTWARE=1 \
+        GALLIUM_DRIVER=llvmpipe \
+        __GLX_VENDOR_LIBRARY_NAME=mesa \
+        __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
+        Xorg :${DISPLAY_NUM} \
+            -config "$XORG_CONF" \
+            -noreset \
+            +extension GLX \
+            +extension RANDR \
+            +extension RENDER \
+            -nolisten tcp \
+            -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
+    fi
+
     XORG_PID=$!
     echo "Started X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
 
@@ -108,7 +126,7 @@ start_x_with_gpu() {
         exit 1
     fi
 
-    echo "X server running with GLX (ProjectM uses Mesa software GL, encoder uses GPU)"
+    echo "X server running with GLX (ProjectM uses ${RENDER_MODE}, encoder uses GPU)"
 }
 
 start_xvfb_fallback() {

@@ -123,8 +123,11 @@ ENV MESA_GL_VERSION_OVERRIDE=4.5
 ENV MESA_GLSL_VERSION_OVERRIDE=450
 ENV GST_GL_SHADER_DEBUG=0
 
-# Copy xorg.conf for headless NVIDIA rendering
+# Copy xorg configs for both rendering modes
+# xorg.conf: dummy driver + Mesa software rendering (v35 stable fallback)
+# xorg-nvidia.conf: NVIDIA driver for GPU-accelerated rendering (v36-gpu)
 COPY xorg.conf /etc/X11/xorg.conf
+COPY xorg-nvidia.conf /etc/X11/xorg-nvidia.conf
 
 # Ensure libraries are found
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
