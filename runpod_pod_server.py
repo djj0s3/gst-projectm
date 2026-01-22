@@ -2,13 +2,19 @@ import os
 import shutil
 import subprocess
 import tempfile
+import traceback
+import logging
 from pathlib import Path
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse, Response
 import uvicorn
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DEFAULT_PRESET_DIR = os.environ.get("RUNPOD_PRESET_DIR", "/usr/local/share/projectM/presets")
 DEFAULT_TEXTURE_DIR = os.environ.get("RUNPOD_TEXTURE_DIR", "/usr/local/share/projectM/textures")
@@ -17,6 +23,54 @@ DEFAULT_TIMEOUT_SEC = float(os.environ.get("RUNPOD_CONVERT_TIMEOUT", "10800"))
 AUTH_TOKEN = os.environ.get("RUNPOD_POD_AUTH_TOKEN", "").strip()
 
 app = FastAPI(title="ProjectM Renderer Pod")
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch all unhandled exceptions and return JSON with details."""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "traceback": traceback.format_exc()[-2000:],
+        }
+    )
+
+
+@app.get("/debug")
+async def debug():
+    """Return diagnostic information about the pod environment."""
+    import subprocess
+    info = {
+        "env": {
+            "USE_NVIDIA_GPU": os.environ.get("USE_NVIDIA_GPU", "not set"),
+            "RUNPOD_START_SERVER": os.environ.get("RUNPOD_START_SERVER", "not set"),
+            "DISPLAY": os.environ.get("DISPLAY", "not set"),
+        },
+        "checks": {}
+    }
+
+    # Check nvidia-smi
+    try:
+        result = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+        info["checks"]["nvidia_smi"] = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    except Exception as e:
+        info["checks"]["nvidia_smi"] = f"Error: {e}"
+
+    # Check /dev/dri
+    try:
+        result = subprocess.run(["ls", "-la", "/dev/dri/"], capture_output=True, text=True, timeout=5)
+        info["checks"]["dev_dri"] = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    except Exception as e:
+        info["checks"]["dev_dri"] = f"Error: {e}"
+
+    # Check xorg configs
+    info["checks"]["xorg_conf_exists"] = os.path.exists("/etc/X11/xorg.conf")
+    info["checks"]["xorg_nvidia_conf_exists"] = os.path.exists("/etc/X11/xorg-nvidia.conf")
+
+    return info
 
 
 def _require_auth(header: Optional[str]) -> None:
@@ -122,21 +176,56 @@ async def render(
                 text=True,
                 timeout=timeout_sec,
             )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Conversion timed out")
+        except subprocess.TimeoutExpired as e:
+            raise HTTPException(status_code=504, detail={
+                "error": "Conversion timed out",
+                "stdout": getattr(e, 'stdout', '')[-2000:] if getattr(e, 'stdout', None) else '',
+                "stderr": getattr(e, 'stderr', '')[-2000:] if getattr(e, 'stderr', None) else '',
+            })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail={
+                "error": f"Subprocess error: {type(e).__name__}: {str(e)}",
+                "cmd": cmd,
+            })
+
+        # Log subprocess output for debugging
+        logger.info(f"Subprocess return code: {completed.returncode}")
+        logger.info(f"Output path: {output_path}")
+        logger.info(f"Output file exists: {output_path.exists()}")
+        if completed.stdout:
+            logger.info(f"stdout (last 1000 chars): {completed.stdout[-1000:]}")
+        if completed.stderr:
+            logger.info(f"stderr (last 1000 chars): {completed.stderr[-1000:]}")
+
+        # List tmp directory contents for debugging
+        try:
+            contents = list(tmp_path.iterdir())
+            logger.info(f"Temp directory contents: {contents}")
+        except Exception as e:
+            logger.error(f"Could not list temp directory: {e}")
 
         if completed.returncode != 0 or not output_path.exists():
             detail = {
-                "stdout": completed.stdout[-2000:],
-                "stderr": completed.stderr[-2000:],
+                "returncode": completed.returncode,
+                "output_exists": output_path.exists(),
+                "stdout": completed.stdout[-2000:] if completed.stdout else "",
+                "stderr": completed.stderr[-2000:] if completed.stderr else "",
             }
             raise HTTPException(status_code=500, detail=detail)
 
+        # Read file into memory before temp directory is cleaned up
+        # (FileResponse is async and temp dir gets deleted before it can stream)
+        with open(output_path, "rb") as f:
+            video_data = f.read()
+
         headers = {
-            "X-Convert-Stdout": completed.stdout[-512:],
-            "X-Convert-Stderr": completed.stderr[-512:],
+            "Content-Disposition": f'attachment; filename="{DEFAULT_OUTPUT_NAME}"',
         }
-        return FileResponse(path=output_path, filename=DEFAULT_OUTPUT_NAME, headers=headers)
+        return Response(
+            content=video_data,
+            media_type="video/mp4",
+            headers=headers,
+        )
 
 
 if __name__ == "__main__":
