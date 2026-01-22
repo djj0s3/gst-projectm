@@ -82,24 +82,69 @@ start_x_with_gpu() {
     if [ "${USE_NVIDIA_GPU:-0}" -eq 1 ]; then
         echo "Attempting GPU-accelerated rendering..."
 
-        # Check for DRI render node (works without X for compute/render)
+        # Check for DRI render node
         RENDER_NODE=$(ls /dev/dri/renderD* 2>/dev/null | head -1)
-        if [ -n "$RENDER_NODE" ]; then
-            echo "Found render node: $RENDER_NODE"
-            # Try EGL surfaceless rendering (no X server needed)
+        CARD_NODE=$(ls /dev/dri/card* 2>/dev/null | head -1)
+        HAS_NVIDIA_EGL=$(test -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json && echo "yes" || echo "no")
+        HAS_NVIDIA_GLX=$(ldconfig -p 2>/dev/null | grep -q "libGLX_nvidia" && echo "yes" || echo "no")
+
+        echo "Render node: ${RENDER_NODE:-none}"
+        echo "Card node: ${CARD_NODE:-none}"
+        echo "NVIDIA EGL vendor available: $HAS_NVIDIA_EGL"
+        echo "NVIDIA GLX available: $HAS_NVIDIA_GLX"
+
+        # Method 1: Try EGL-GBM (headless GPU rendering without X)
+        if [ "$HAS_NVIDIA_EGL" = "yes" ] && [ -n "$RENDER_NODE" ]; then
+            echo "Trying EGL-GBM headless GPU rendering..."
+
+            # EGL-GBM configuration
             export GST_GL_PLATFORM=egl
-            export GST_GL_WINDOW=surfaceless
+            export GST_GL_WINDOW=gbm
             export GST_GL_API=opengl3
-            export EGL_PLATFORM=surfaceless
-            # Point to the render device
-            export DRI_PRIME=1
-            RENDER_MODE="EGL surfaceless (GPU)"
-            echo "Using EGL surfaceless rendering on GPU with OpenGL 3"
-            # No X server needed for surfaceless EGL
-            XORG_PID=""
+            # Point GBM to the render node
+            export GBM_DEVICE="$RENDER_NODE"
+            # Use NVIDIA EGL
+            export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+            # Disable vsync for headless
+            export __GL_SYNC_TO_VBLANK=0
+            export vblank_mode=0
+
+            # Test if EGL-GBM works by checking if we can get an EGL display
+            # (We'll know for real when the pipeline starts)
+            RENDER_MODE="EGL-GBM (GPU)"
+            unset DISPLAY
+
+            echo "EGL-GBM configured with render node: $RENDER_NODE"
+
+        # Method 2: Fallback to X11 + dummy + try NVIDIA GLX
+        elif [ "$HAS_NVIDIA_GLX" = "yes" ] && [ -n "$RENDER_NODE" ]; then
+            echo "EGL-GBM not available, trying X11 + NVIDIA GLX..."
+
+            # Configure for NVIDIA GLX (hardware-accelerated OpenGL through X)
+            export GST_GL_PLATFORM=glx
+            export GST_GL_WINDOW=x11
+            export GST_GL_API=opengl3
+            # Force NVIDIA GLX vendor
+            export __GLX_VENDOR_LIBRARY_NAME=nvidia
+            # Disable vsync for headless
+            export __GL_SYNC_TO_VBLANK=0
+            export vblank_mode=0
+
+            RENDER_MODE="X11 dummy + NVIDIA GLX (GPU)"
+
+            # Start X with dummy driver - NVIDIA GLX will use the GPU for rendering
+            XORG_CONF="/etc/X11/xorg.conf"
+            Xorg :${DISPLAY_NUM} \
+                -config "$XORG_CONF" \
+                -noreset \
+                +extension GLX \
+                +extension RANDR \
+                +extension RENDER \
+                -nolisten tcp \
+                -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
+            XORG_PID=$!
         else
-            echo "No render node found, falling back to X server..."
-            # Fall back to X server with dummy driver + Mesa
+            echo "NVIDIA GPU rendering not available, falling back to Mesa..."
             USE_NVIDIA_GPU=0
         fi
     fi
@@ -123,13 +168,13 @@ start_x_with_gpu() {
             +extension RENDER \
             -nolisten tcp \
             -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
+        XORG_PID=$!
     fi
 
-    # Only check X server if we started one (not for EGL surfaceless)
+    # Only check X server if we started one (not for EGL-GBM or surfaceless)
     if [ -z "$XORG_PID" ]; then
         echo "Using ${RENDER_MODE} without X server"
     else
-        XORG_PID=$!
         echo "Started X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
 
         # Wait for X server to be ready
@@ -146,6 +191,18 @@ start_x_with_gpu() {
     fi
 
     echo "Render mode: ${RENDER_MODE}"
+
+    # Diagnostic: Check what GL renderer is actually being used
+    echo "=== GL Renderer Diagnostics ==="
+    if command -v glxinfo >/dev/null 2>&1 && [ -n "$DISPLAY" ]; then
+        echo "glxinfo output:"
+        glxinfo -B 2>&1 | head -20 || echo "  glxinfo failed"
+        echo "GLX vendor check:"
+        glxinfo 2>&1 | grep -i "vendor\|renderer\|version" | head -10 || true
+    else
+        echo "glxinfo not available or no DISPLAY set"
+    fi
+    echo "==============================="
 }
 
 start_xvfb_fallback() {

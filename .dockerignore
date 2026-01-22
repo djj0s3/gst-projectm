@@ -1,0 +1,32 @@
+# Generated textures (too large for Docker build context)
+textures/generated
+
+# Git files
+.git
+.gitignore
+
+# IDE and editor files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Build artifacts
+build/
+*.o
+*.so
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+
+# Test files
+*.test
+test_*
+
+# Temporary files
+*.tmp
+*.log
+/tmp

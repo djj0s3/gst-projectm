@@ -13,8 +13,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 import uvicorn
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+logger.info("runpod_pod_server.py: Module loading started")
 
 DEFAULT_PRESET_DIR = os.environ.get("RUNPOD_PRESET_DIR", "/usr/local/share/projectM/presets")
 DEFAULT_TEXTURE_DIR = os.environ.get("RUNPOD_TEXTURE_DIR", "/usr/local/share/projectM/textures")
@@ -43,11 +44,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def debug():
     """Return diagnostic information about the pod environment."""
     import subprocess
+    import glob
     info = {
         "env": {
             "USE_NVIDIA_GPU": os.environ.get("USE_NVIDIA_GPU", "not set"),
             "RUNPOD_START_SERVER": os.environ.get("RUNPOD_START_SERVER", "not set"),
             "DISPLAY": os.environ.get("DISPLAY", "not set"),
+            "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", "not set"),
         },
         "checks": {}
     }
@@ -65,6 +68,46 @@ async def debug():
         info["checks"]["dev_dri"] = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
     except Exception as e:
         info["checks"]["dev_dri"] = f"Error: {e}"
+
+    # Check NVIDIA driver version
+    try:
+        result = subprocess.run(["cat", "/proc/driver/nvidia/version"], capture_output=True, text=True, timeout=5)
+        info["checks"]["nvidia_driver_version"] = result.stdout.strip()[:200] if result.returncode == 0 else "not found"
+    except Exception as e:
+        info["checks"]["nvidia_driver_version"] = f"Error: {e}"
+
+    # Check for NVIDIA libraries
+    nvidia_libs = []
+    for pattern in ["/usr/lib/x86_64-linux-gnu/libnvidia*", "/usr/lib/libnvidia*", "/usr/local/nvidia/lib64/*"]:
+        nvidia_libs.extend(glob.glob(pattern))
+    info["checks"]["nvidia_libs_count"] = len(nvidia_libs)
+    info["checks"]["nvidia_libs_sample"] = nvidia_libs[:10] if nvidia_libs else "none found"
+
+    # Check for X driver modules
+    xorg_drivers = []
+    for pattern in ["/usr/lib/xorg/modules/drivers/*", "/usr/lib/x86_64-linux-gnu/xorg/extra-modules/*"]:
+        xorg_drivers.extend(glob.glob(pattern))
+    info["checks"]["xorg_drivers"] = [os.path.basename(d) for d in xorg_drivers]
+
+    # Check EGL vendors
+    egl_vendors = glob.glob("/usr/share/glvnd/egl_vendor.d/*.json")
+    info["checks"]["egl_vendors"] = [os.path.basename(v) for v in egl_vendors]
+
+    # Check libGL implementation
+    try:
+        result = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=5)
+        libgl_lines = [l.strip() for l in result.stdout.split('\n') if 'libGL' in l or 'libEGL' in l]
+        info["checks"]["libgl_ldconfig"] = libgl_lines[:5]
+    except Exception as e:
+        info["checks"]["libgl_ldconfig"] = f"Error: {e}"
+
+    # Check glxinfo if available
+    try:
+        result = subprocess.run(["glxinfo", "-B"], capture_output=True, text=True, timeout=10,
+                               env={**os.environ, "DISPLAY": ":0"})
+        info["checks"]["glxinfo"] = result.stdout[:500] if result.returncode == 0 else result.stderr[:200]
+    except Exception as e:
+        info["checks"]["glxinfo"] = f"Error: {e}"
 
     # Check xorg configs
     info["checks"]["xorg_conf_exists"] = os.path.exists("/etc/X11/xorg.conf")
@@ -229,4 +272,6 @@ async def render(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("RUNPOD_POD_PORT", "8000")))
+    port = int(os.environ.get("RUNPOD_POD_PORT", "8000"))
+    logger.info(f"Starting server on 0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
