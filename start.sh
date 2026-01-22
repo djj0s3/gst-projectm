@@ -10,6 +10,13 @@ echo "Hostname: $(hostname)"
 echo "Working directory: $(pwd)"
 echo "========================="
 
+# Start SSH daemon for RunPod pod access (if not already running)
+if [ -x /usr/sbin/sshd ] && ! pgrep -x sshd > /dev/null; then
+    echo "Starting SSH daemon..."
+    /usr/sbin/sshd
+    echo "SSH daemon started on port 22"
+fi
+
 # If explicitly asked to start the HTTP server (argument or env), do so.
 if [[ "$RUNPOD_START_SERVER" == "1" ]]; then
     echo "Starting pod server on port ${RUNPOD_POD_PORT:-8000}..."

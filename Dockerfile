@@ -41,7 +41,8 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
         python3 \
         python3-pip \
         python3-venv \
-        sudo
+        sudo \
+        openssh-server
 
 # Clone the projectM repository and build it
 RUN git clone --depth 1 https://github.com/projectM-visualizer/projectm.git /tmp/projectm
@@ -131,6 +132,19 @@ COPY xorg-nvidia.conf /etc/X11/xorg-nvidia.conf
 
 # Ensure libraries are found
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+
+# Configure SSH for RunPod pod access
+RUN mkdir -p /var/run/sshd && \
+    ssh-keygen -A && \
+    echo 'root:runpod' | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#Port 22/Port 22/' /etc/ssh/sshd_config && \
+    echo "export PATH=$PATH" >> /root/.bashrc && \
+    echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> /root/.bashrc
+
+# Expose SSH and HTTP ports
+EXPOSE 22 8000
 
 # Default entrypoint dispatches between conversion and server modes
 ENTRYPOINT ["/app/start.sh"]
