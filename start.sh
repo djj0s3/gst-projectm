@@ -32,6 +32,13 @@ if [[ "$#" -gt 0 ]]; then
     exec /app/convert.sh "$@"
 fi
 
-# Default: run the RunPod serverless handler (expected in serverless deployments).
-echo "Starting serverless handler..."
-exec python /app/runpod_handler.py
+# Check if we're in a serverless environment
+if [[ -n "$RUNPOD_ENDPOINT_ID" || -n "$RUNPOD_JOB_ID" ]]; then
+    # Serverless mode - use the serverless handler
+    echo "Starting serverless handler..."
+    exec python /app/runpod_handler.py
+else
+    # Pod mode without server flag - start the HTTP server by default
+    echo "Starting pod server (default mode) on port ${RUNPOD_POD_PORT:-8000}..."
+    exec python /app/runpod_pod_server.py
+fi
