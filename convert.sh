@@ -80,20 +80,32 @@ start_x_with_gpu() {
 
     # Check if we should use NVIDIA GPU rendering (set USE_NVIDIA_GPU=1 for pods)
     if [ "${USE_NVIDIA_GPU:-0}" -eq 1 ]; then
-        echo "Starting X server with NVIDIA driver for GPU-accelerated rendering..."
-        # Use NVIDIA driver with full GPU acceleration
-        XORG_CONF="/etc/X11/xorg-nvidia.conf"
-        RENDER_MODE="NVIDIA GPU"
-        # No Mesa forcing - use native NVIDIA libraries
-        Xorg :${DISPLAY_NUM} \
-            -config "$XORG_CONF" \
-            -noreset \
-            +extension GLX \
-            +extension RANDR \
-            +extension RENDER \
-            -nolisten tcp \
-            -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
-    else
+        echo "Attempting GPU-accelerated rendering..."
+
+        # Check for DRI render node (works without X for compute/render)
+        RENDER_NODE=$(ls /dev/dri/renderD* 2>/dev/null | head -1)
+        if [ -n "$RENDER_NODE" ]; then
+            echo "Found render node: $RENDER_NODE"
+            # Try EGL surfaceless rendering (no X server needed)
+            export GST_GL_PLATFORM=egl
+            export GST_GL_WINDOW=surfaceless
+            export GST_GL_API=opengl3
+            export EGL_PLATFORM=surfaceless
+            # Point to the render device
+            export DRI_PRIME=1
+            RENDER_MODE="EGL surfaceless (GPU)"
+            echo "Using EGL surfaceless rendering on GPU with OpenGL 3"
+            # No X server needed for surfaceless EGL
+            XORG_PID=""
+        else
+            echo "No render node found, falling back to X server..."
+            # Fall back to X server with dummy driver + Mesa
+            USE_NVIDIA_GPU=0
+        fi
+    fi
+
+    # Fallback to Mesa if USE_NVIDIA_GPU is 0 or was reset above
+    if [ "${USE_NVIDIA_GPU:-0}" -eq 0 ]; then
         echo "Starting X server with dummy driver and Mesa software rendering..."
         # Use dummy driver with Mesa software rendering (v35 stable fallback)
         XORG_CONF="/etc/X11/xorg.conf"
@@ -113,20 +125,27 @@ start_x_with_gpu() {
             -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
     fi
 
-    XORG_PID=$!
-    echo "Started X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
+    # Only check X server if we started one (not for EGL surfaceless)
+    if [ -z "$XORG_PID" ]; then
+        echo "Using ${RENDER_MODE} without X server"
+    else
+        XORG_PID=$!
+        echo "Started X server on display :${DISPLAY_NUM} (PID: $XORG_PID)"
 
-    # Wait for X server to be ready
-    sleep 2
-    if ! kill -0 $XORG_PID 2>/dev/null; then
-        echo "ERROR: X server failed to start (PID $XORG_PID is not running)"
-        echo "--- X server log ---"
-        cat /tmp/Xorg.${DISPLAY_NUM}.log 2>/dev/null || echo "No log file found"
-        echo "--- end X server log ---"
-        exit 1
+        # Wait for X server to be ready
+        sleep 2
+        if ! kill -0 $XORG_PID 2>/dev/null; then
+            echo "ERROR: X server failed to start (PID $XORG_PID is not running)"
+            echo "--- X server log ---"
+            cat /tmp/Xorg.${DISPLAY_NUM}.log 2>/dev/null || echo "No log file found"
+            echo "--- end X server log ---"
+            exit 1
+        fi
+
+        echo "X server running on display :${DISPLAY_NUM}"
     fi
 
-    echo "X server running with GLX (ProjectM uses ${RENDER_MODE}, encoder uses GPU)"
+    echo "Render mode: ${RENDER_MODE}"
 }
 
 start_xvfb_fallback() {
