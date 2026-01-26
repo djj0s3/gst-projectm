@@ -34,9 +34,22 @@ if [[ "$1" == "python" && "$2" == "/app/runpod_pod_server.py" ]]; then
     exec python "$@"
 fi
 
-# If arguments were provided, treat them as convert.sh invocation (legacy/pod mode).
+# If a shell command is provided via dockerArgs, execute it directly
+if [[ "$1" == "bash" || "$1" == "/bin/bash" || "$1" == "sh" || "$1" == "/bin/sh" ]]; then
+    echo "Executing shell command: $@"
+    exec "$@"
+fi
+
+# If arguments were provided that look like convert.sh options, run convert.sh
 if [[ "$#" -gt 0 ]]; then
-    exec /app/convert.sh "$@"
+    # Check if first arg looks like a convert.sh option (starts with -)
+    if [[ "$1" == -* ]]; then
+        exec /app/convert.sh "$@"
+    else
+        # Unknown argument - try to exec it directly
+        echo "Executing custom command: $@"
+        exec "$@"
+    fi
 fi
 
 # Check if we're in a serverless environment

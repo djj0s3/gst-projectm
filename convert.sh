@@ -93,8 +93,19 @@ start_x_with_gpu() {
         echo "NVIDIA EGL vendor available: $HAS_NVIDIA_EGL"
         echo "NVIDIA GLX available: $HAS_NVIDIA_GLX"
 
-        # Method 1: Try EGL-GBM (headless GPU rendering without X)
-        if [ "$HAS_NVIDIA_EGL" = "yes" ] && [ -n "$RENDER_NODE" ]; then
+        # Check if DRI render node is accessible (can be opened)
+        DRI_ACCESSIBLE="no"
+        if [ -n "$RENDER_NODE" ]; then
+            if python3 -c "import os; fd=os.open('$RENDER_NODE', os.O_RDWR); os.close(fd)" 2>/dev/null; then
+                DRI_ACCESSIBLE="yes"
+                echo "DRI render node is accessible"
+            else
+                echo "DRI render node exists but is NOT accessible (permission denied)"
+            fi
+        fi
+
+        # Method 1a: Try EGL-GBM if DRI is accessible (headless GPU rendering without X)
+        if [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
             echo "Trying EGL-GBM headless GPU rendering..."
 
             # EGL-GBM configuration
@@ -109,12 +120,18 @@ start_x_with_gpu() {
             export __GL_SYNC_TO_VBLANK=0
             export vblank_mode=0
 
-            # Test if EGL-GBM works by checking if we can get an EGL display
-            # (We'll know for real when the pipeline starts)
             RENDER_MODE="EGL-GBM (GPU)"
             unset DISPLAY
 
             echo "EGL-GBM configured with render node: $RENDER_NODE"
+
+        # Method 1b: EGL surfaceless is currently disabled due to framebuffer issues
+        # ProjectM requires a proper framebuffer which surfaceless EGL doesn't provide
+        # Fall through to Mesa software rendering instead
+        elif [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" != "yes" ]; then
+            echo "DRI not accessible, EGL surfaceless has known framebuffer issues"
+            echo "Falling back to Mesa software rendering..."
+            USE_NVIDIA_GPU=0
 
         # Method 2: Fallback to X11 + dummy + try NVIDIA GLX
         elif [ "$HAS_NVIDIA_GLX" = "yes" ] && [ -n "$RENDER_NODE" ]; then
