@@ -119,21 +119,37 @@ start_x_with_gpu() {
             # Disable vsync for headless
             export __GL_SYNC_TO_VBLANK=0
             export vblank_mode=0
+            # Force FBO rendering for headless EGL (no default framebuffer)
+            export GST_PROJECTM_FORCE_FBO=1
 
             RENDER_MODE="EGL-GBM (GPU)"
             unset DISPLAY
 
             echo "EGL-GBM configured with render node: $RENDER_NODE"
 
-        # Method 1b: DRI not accessible - fall back to Mesa
-        # Note: EGL-device mode (EGL_PLATFORM_DEVICE_EXT) creates the GL context successfully,
-        # but ProjectM has framebuffer issues because it renders to default framebuffer (0)
-        # which doesn't exist in headless EGL modes. This requires ProjectM plugin modification.
-        # For now, fall back to Mesa software rendering which is reliable.
+        # Method 1b: Try EGL-device mode if DRI isn't accessible but NVIDIA EGL is available
+        # This uses EGL_PLATFORM_DEVICE_EXT for surfaceless rendering
+        # The gst-projectm plugin now supports FBO rendering for headless modes
         elif [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" != "yes" ]; then
-            echo "DRI not accessible - ProjectM requires framebuffer which headless EGL lacks"
-            echo "Falling back to Mesa software rendering (reliable but slower)..."
-            USE_NVIDIA_GPU=0
+            echo "DRI not accessible, trying EGL-device surfaceless rendering..."
+
+            # EGL-device configuration for surfaceless rendering
+            export GST_GL_PLATFORM=egl
+            export GST_GL_WINDOW=surfaceless
+            export GST_GL_API=opengl3
+            # Use NVIDIA EGL device
+            export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+            export EGL_PLATFORM=device
+            # Disable vsync for headless
+            export __GL_SYNC_TO_VBLANK=0
+            export vblank_mode=0
+            # Force FBO rendering - essential for surfaceless EGL (no default framebuffer)
+            export GST_PROJECTM_FORCE_FBO=1
+
+            RENDER_MODE="EGL-device surfaceless (GPU)"
+            unset DISPLAY
+
+            echo "EGL-device surfaceless configured with FBO rendering"
 
         # Method 2: Fallback to X11 + dummy + try NVIDIA GLX
         elif [ "$HAS_NVIDIA_GLX" = "yes" ] && [ -n "$RENDER_NODE" ]; then
@@ -273,6 +289,8 @@ use_headless_gpu() {
     export GST_GL_CONFIG=${GST_GL_CONFIG:-rgba}
     export GST_GL_EGL_PLATFORM=${GST_GL_EGL_PLATFORM:-surfaceless}
     export EGL_PLATFORM=${EGL_PLATFORM:-surfaceless}
+    # Force FBO rendering - essential for headless EGL (no default framebuffer)
+    export GST_PROJECTM_FORCE_FBO=1
 }
 
 set_auto_mesh() {
@@ -513,6 +531,9 @@ echo "DISPLAY: ${DISPLAY:-unset}"
 echo "NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-unset}"
 echo "GST_PLUGIN_PATH: ${GST_PLUGIN_PATH:-unset}"
 echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-unset}"
+echo "GST_PROJECTM_FORCE_FBO: ${GST_PROJECTM_FORCE_FBO:-unset}"
+echo "GST_GL_PLATFORM: ${GST_GL_PLATFORM:-unset}"
+echo "GST_GL_WINDOW: ${GST_GL_WINDOW:-unset}"
 
 # Check for GPU devices
 if [ "$use_gpu" -eq 1 ]; then

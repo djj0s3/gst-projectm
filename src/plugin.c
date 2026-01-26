@@ -126,6 +126,9 @@ struct _GstProjectMPrivate {
   gsize fbo_height;
   gboolean fbo_initialized;
   gboolean fbo_warned_missing_support;
+
+  gboolean headless_mode;
+  gboolean headless_checked;
 };
 
 G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
@@ -583,6 +586,64 @@ static void gst_projectm_release_pbos(GstProjectM *plugin,
 }
 
 static gboolean
+gst_projectm_check_headless_mode(GstProjectM *plugin,
+                                  const GstGLFuncs *glFunctions) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  if (priv->headless_checked) {
+    return priv->headless_mode;
+  }
+
+  priv->headless_checked = TRUE;
+  priv->headless_mode = FALSE;
+
+  /* Check for environment variable to force FBO/headless mode */
+  const gchar *force_fbo = g_getenv("GST_PROJECTM_FORCE_FBO");
+  if (force_fbo && (g_ascii_strcasecmp(force_fbo, "1") == 0 ||
+                    g_ascii_strcasecmp(force_fbo, "true") == 0 ||
+                    g_ascii_strcasecmp(force_fbo, "yes") == 0)) {
+    priv->headless_mode = TRUE;
+    GST_INFO_OBJECT(plugin,
+                    "FBO mode forced via GST_PROJECTM_FORCE_FBO environment variable");
+    return TRUE;
+  }
+
+  if (!glFunctions || !glFunctions->CheckFramebufferStatus ||
+      !glFunctions->BindFramebuffer) {
+    return FALSE;
+  }
+
+  /* Save current framebuffer binding */
+  GLint current_fbo = 0;
+  if (glFunctions->GetIntegerv) {
+    glFunctions->GetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fbo);
+  }
+
+  /* Bind default framebuffer (0) and check its status */
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  GLenum status = glFunctions->CheckFramebufferStatus(GL_FRAMEBUFFER);
+
+  /* Restore previous binding */
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, (GLuint)current_fbo);
+
+  /* In headless mode, framebuffer 0 will be incomplete or undefined */
+  if (status != GL_FRAMEBUFFER_COMPLETE) {
+    priv->headless_mode = TRUE;
+    GST_INFO_OBJECT(plugin,
+                    "Detected headless mode (default framebuffer status=0x%x); "
+                    "FBO rendering required",
+                    status);
+  } else {
+    GST_DEBUG_OBJECT(plugin,
+                     "Default framebuffer available (status=0x%x); "
+                     "FBO optional",
+                     status);
+  }
+
+  return priv->headless_mode;
+}
+
+static gboolean
 gst_projectm_has_rt_support(GstProjectM *plugin,
                             const GstGLFuncs *glFunctions) {
 #define GST_PROJECTM_REQUIRE_GL_FUNC(func)                                     \
@@ -622,10 +683,25 @@ static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
 
   if (priv->fbo_initialized && priv->fbo_width == width &&
       priv->fbo_height == height) {
+    /* Ensure FBO is bound - it might have been unbound by something else */
+    if (glFunctions->BindFramebuffer) {
+      glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->fbo_id);
+    }
     return TRUE;
   }
 
-  gst_projectm_release_render_target(plugin, glFunctions);
+  /* Save old FBO info - we'll delete after new one is bound to avoid
+   * ever binding framebuffer 0 in headless mode */
+  GLuint old_fbo = priv->fbo_id;
+  GLuint old_tex = priv->fbo_texture_id;
+  GLuint old_depth = priv->fbo_depth_buffer_id;
+  gboolean had_old = priv->fbo_initialized;
+
+  /* Clear the state - we'll set new values below */
+  priv->fbo_id = 0;
+  priv->fbo_texture_id = 0;
+  priv->fbo_depth_buffer_id = 0;
+  priv->fbo_initialized = FALSE;
 
   GLuint new_fbo = 0;
   GLuint new_tex = 0;
@@ -696,13 +772,25 @@ static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
     }
   }
 
-  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
-
   if (!success) {
+    /* Clean up the new FBO that failed */
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
     glFunctions->DeleteFramebuffers(1, &new_fbo);
     glFunctions->DeleteTextures(1, &new_tex);
     if (new_depth != 0 && glFunctions->DeleteRenderbuffers) {
       glFunctions->DeleteRenderbuffers(1, &new_depth);
+    }
+    /* Also clean up old resources if any */
+    if (had_old) {
+      if (old_fbo != 0 && glFunctions->DeleteFramebuffers) {
+        glFunctions->DeleteFramebuffers(1, &old_fbo);
+      }
+      if (old_tex != 0 && glFunctions->DeleteTextures) {
+        glFunctions->DeleteTextures(1, &old_tex);
+      }
+      if (old_depth != 0 && glFunctions->DeleteRenderbuffers) {
+        glFunctions->DeleteRenderbuffers(1, &old_depth);
+      }
     }
     return FALSE;
   }
@@ -713,6 +801,26 @@ static gboolean gst_projectm_ensure_render_target(GstProjectM *plugin,
   priv->fbo_width = width;
   priv->fbo_height = height;
   priv->fbo_initialized = TRUE;
+
+  /* Now delete the old FBO resources (after new FBO is bound and initialized).
+   * This ensures we never have framebuffer 0 bound in headless mode. */
+  if (had_old) {
+    if (old_fbo != 0 && glFunctions->DeleteFramebuffers) {
+      glFunctions->DeleteFramebuffers(1, &old_fbo);
+    }
+    if (old_tex != 0 && glFunctions->DeleteTextures) {
+      glFunctions->DeleteTextures(1, &old_tex);
+    }
+    if (old_depth != 0 && glFunctions->DeleteRenderbuffers) {
+      glFunctions->DeleteRenderbuffers(1, &old_depth);
+    }
+    GST_DEBUG_OBJECT(plugin, "Deleted old FBO %u", old_fbo);
+  }
+
+  /* Keep the FBO bound - do NOT unbind to framebuffer 0.
+   * In headless EGL modes, framebuffer 0 doesn't exist. */
+  GST_DEBUG_OBJECT(plugin, "Created FBO %u (%zux%zu) and keeping it bound",
+                   new_fbo, width, height);
 
   return TRUE;
 }
@@ -1019,6 +1127,8 @@ static void gst_projectm_init(GstProjectM *plugin) {
   plugin->priv->fbo_height = 0;
   plugin->priv->fbo_initialized = FALSE;
   plugin->priv->fbo_warned_missing_support = FALSE;
+  plugin->priv->headless_mode = FALSE;
+  plugin->priv->headless_checked = FALSE;
 }
 
 static void gst_projectm_finalize(GObject *object) {
@@ -1051,11 +1161,14 @@ static void gst_projectm_gl_stop(GstGLBaseAudioVisualizer *src) {
   plugin->priv->timeline_initialized = FALSE;
   plugin->priv->first_frame_received = FALSE;
   plugin->priv->first_frame_time = GST_CLOCK_TIME_NONE;
+  plugin->priv->headless_checked = FALSE;
+  plugin->priv->headless_mode = FALSE;
 }
 
 static gboolean gst_projectm_gl_start(GstGLBaseAudioVisualizer *glav) {
   // Cast the audio visualizer to the ProjectM plugin
   GstProjectM *plugin = GST_PROJECTM(glav);
+  const GstGLFuncs *glFunctions = glav->context->gl_vtable;
 
 #ifdef USE_GLEW
   GST_DEBUG_OBJECT(plugin, "Initializing GLEW");
@@ -1065,6 +1178,29 @@ static gboolean gst_projectm_gl_start(GstGLBaseAudioVisualizer *glav) {
     return FALSE;
   }
 #endif
+
+  /* Check for headless mode early - we need to create FBO before ProjectM init */
+  gboolean is_headless = gst_projectm_check_headless_mode(plugin, glFunctions);
+
+  if (is_headless) {
+    GST_INFO_OBJECT(plugin, "Headless mode detected, creating FBO before ProjectM init");
+
+    /* Create FBO with a default size - will be resized on first render if needed */
+    /* Use 1920x1080 as initial size, common for video output */
+    gboolean fbo_ok = gst_projectm_ensure_render_target(plugin, glFunctions, 1920, 1080);
+    if (!fbo_ok) {
+      GST_ERROR_OBJECT(plugin,
+                       "Headless mode requires FBO but FBO creation failed");
+      return FALSE;
+    }
+
+    /* Bind the FBO so ProjectM sees it as the current framebuffer during init */
+    if (glFunctions->BindFramebuffer) {
+      glFunctions->BindFramebuffer(GL_FRAMEBUFFER, plugin->priv->fbo_id);
+      GST_DEBUG_OBJECT(plugin, "Bound FBO %u before ProjectM initialization",
+                       plugin->priv->fbo_id);
+    }
+  }
 
   // Check if ProjectM instance exists, and create if not
   if (!plugin->priv->handle) {
@@ -1193,13 +1329,27 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
 
   projectm_get_window_size(plugin->priv->handle, &windowWidth, &windowHeight);
 
+  /* Check if we're in headless mode (no default framebuffer) */
+  gboolean is_headless = gst_projectm_check_headless_mode(plugin, glFunctions);
+
   gboolean using_fbo = gst_projectm_ensure_render_target(
       plugin, glFunctions, windowWidth, windowHeight);
   gboolean restore_viewport = FALSE;
   GLint previous_viewport[4] = {0, 0, 0, 0};
 
+  /* In headless mode, we MUST have an FBO to render to */
+  if (is_headless && !using_fbo) {
+    GST_ERROR_OBJECT(plugin,
+                     "Headless mode detected but FBO creation failed; "
+                     "cannot render without a valid framebuffer");
+    gst_buffer_unmap(audio, &audioMap);
+    return FALSE;
+  }
+
   if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
     glFunctions->BindFramebuffer(GL_FRAMEBUFFER, plugin->priv->fbo_id);
+    GST_LOG_OBJECT(plugin, "Bound FBO %u for rendering (%zux%zu)",
+                   plugin->priv->fbo_id, windowWidth, windowHeight);
     if (glFunctions->Viewport) {
       if (glFunctions->GetIntegerv) {
         glFunctions->GetIntegerv(GL_VIEWPORT, previous_viewport);
@@ -1207,12 +1357,18 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
       }
       glFunctions->Viewport(0, 0, (GLsizei)windowWidth, (GLsizei)windowHeight);
     }
-  } else if (glFunctions && glFunctions->BindFramebuffer) {
+  } else if (!is_headless && glFunctions && glFunctions->BindFramebuffer) {
+    /* Only bind framebuffer 0 if we're NOT in headless mode */
     glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
   }
 
   projectm_opengl_render_frame(plugin->priv->handle);
   gl_error_handler(glav->context, plugin);
+
+  /* Ensure FBO is still bound for ReadPixels (ProjectM may have unbound it) */
+  if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, plugin->priv->fbo_id);
+  }
 
   gboolean used_async = FALSE;
   if (gst_projectm_ensure_pbos(plugin, glFunctions, windowWidth,
@@ -1228,7 +1384,10 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
   }
 
   if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
-    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+    /* In headless mode, don't unbind to framebuffer 0 since it doesn't exist */
+    if (!is_headless) {
+      glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
     if (restore_viewport && glFunctions->Viewport) {
       glFunctions->Viewport(previous_viewport[0], previous_viewport[1],
                             previous_viewport[2], previous_viewport[3]);
