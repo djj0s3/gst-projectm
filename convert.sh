@@ -125,12 +125,14 @@ start_x_with_gpu() {
 
             echo "EGL-GBM configured with render node: $RENDER_NODE"
 
-        # Method 1b: EGL surfaceless is currently disabled due to framebuffer issues
-        # ProjectM requires a proper framebuffer which surfaceless EGL doesn't provide
-        # Fall through to Mesa software rendering instead
+        # Method 1b: DRI not accessible - fall back to Mesa
+        # Note: EGL-device mode (EGL_PLATFORM_DEVICE_EXT) creates the GL context successfully,
+        # but ProjectM has framebuffer issues because it renders to default framebuffer (0)
+        # which doesn't exist in headless EGL modes. This requires ProjectM plugin modification.
+        # For now, fall back to Mesa software rendering which is reliable.
         elif [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" != "yes" ]; then
-            echo "DRI not accessible, EGL surfaceless has known framebuffer issues"
-            echo "Falling back to Mesa software rendering..."
+            echo "DRI not accessible - ProjectM requires framebuffer which headless EGL lacks"
+            echo "Falling back to Mesa software rendering (reliable but slower)..."
             USE_NVIDIA_GPU=0
 
         # Method 2: Fallback to X11 + dummy + try NVIDIA GLX
