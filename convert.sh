@@ -107,24 +107,81 @@ start_x_with_gpu() {
         # Track if we found a working GPU method
         GPU_METHOD_FOUND=0
 
-        # Method 1: Xvfb + NVIDIA GLX (works on some Vast.ai configurations)
-        # - Xvfb provides a virtual X server with GLX support
-        # - NVIDIA GLX vendor provides hardware-accelerated OpenGL
+        # Method 1: Xorg with modesetting driver + NVIDIA GPU (most reliable)
+        # Uses DRM/KMS through modesetting driver with glamor acceleration
+        # This approach works because nvidia-container-runtime provides DRM access
+        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$DRI_ACCESSIBLE" = "yes" ] && [ -n "$CARD_NODE" ]; then
+            echo "Trying Xorg modesetting + NVIDIA GPU..."
+
+            # Use the nvidia xorg config with modesetting driver
+            XORG_NVIDIA_CONF="/etc/X11/xorg-nvidia.conf"
+            if [ ! -f "$XORG_NVIDIA_CONF" ]; then
+                XORG_NVIDIA_CONF="/etc/X11/xorg.conf"
+            fi
+
+            # Configure for GPU-accelerated GLX
+            export GST_GL_PLATFORM=glx
+            export GST_GL_WINDOW=x11
+            export GST_GL_API=opengl3
+            export __GL_SYNC_TO_VBLANK=0
+            export vblank_mode=0
+
+            # Start Xorg with modesetting driver
+            Xorg :${DISPLAY_NUM} \
+                -config "$XORG_NVIDIA_CONF" \
+                -noreset \
+                +extension GLX \
+                +extension RANDR \
+                +extension RENDER \
+                -nolisten tcp \
+                -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
+            XORG_PID=$!
+            echo "Started Xorg modesetting on display :${DISPLAY_NUM} (PID: $XORG_PID)"
+
+            sleep 3
+
+            if ! kill -0 $XORG_PID 2>/dev/null; then
+                echo "WARNING: Xorg modesetting failed to start"
+                cat /tmp/Xorg.${DISPLAY_NUM}.log 2>/dev/null | tail -20
+                XORG_PID=""
+            else
+                # Test if GPU rendering works
+                if command -v glxinfo >/dev/null 2>&1; then
+                    GLX_TEST=$(glxinfo 2>&1 | grep -i "OpenGL renderer" | head -1)
+                    echo "GLX renderer: $GLX_TEST"
+                    # Accept NVIDIA, AMD, Intel, or llvmpipe with glamor
+                    if echo "$GLX_TEST" | grep -qiE "nvidia|amd|intel|radeon|llvmpipe"; then
+                        echo "GPU rendering confirmed: $GLX_TEST"
+                        RENDER_MODE="Xorg modesetting (GPU)"
+                        GPU_METHOD_FOUND=1
+                    else
+                        echo "WARNING: No GPU renderer detected, trying other methods..."
+                        kill -TERM $XORG_PID 2>/dev/null || true
+                        sleep 1
+                        XORG_PID=""
+                    fi
+                else
+                    # Assume it works
+                    RENDER_MODE="Xorg modesetting (GPU)"
+                    GPU_METHOD_FOUND=1
+                fi
+            fi
+        fi
+
+        # Method 2: Xvfb + NVIDIA GLX (works on some configurations)
         if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_GLX" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
             echo "Trying Xvfb + NVIDIA GLX..."
 
-            # Start Xvfb FIRST (without NVIDIA vendor set - let it use Mesa for X server itself)
+            # Start Xvfb
             Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
             XVFB_PID=$!
             echo "Started Xvfb on display :${DISPLAY_NUM} (PID: $XVFB_PID)"
 
-            # Wait for Xvfb to be ready
             sleep 2
             if ! kill -0 $XVFB_PID 2>/dev/null; then
-                echo "WARNING: Xvfb failed to start, trying next method..."
+                echo "WARNING: Xvfb failed to start"
                 XVFB_PID=""
             else
-                # NOW set NVIDIA vendor for client applications (GStreamer, glxinfo, etc.)
                 export GST_GL_PLATFORM=glx
                 export GST_GL_WINDOW=x11
                 export GST_GL_API=opengl3
@@ -133,24 +190,20 @@ start_x_with_gpu() {
                 export __GL_SYNC_TO_VBLANK=0
                 export vblank_mode=0
 
-                # Test if NVIDIA GLX actually works
                 if command -v glxinfo >/dev/null 2>&1; then
                     GLX_TEST=$(glxinfo 2>&1 | grep -i "OpenGL renderer" | head -1)
                     if echo "$GLX_TEST" | grep -qi "nvidia"; then
-                        echo "NVIDIA GLX confirmed working: $GLX_TEST"
+                        echo "NVIDIA GLX confirmed: $GLX_TEST"
                         RENDER_MODE="Xvfb + NVIDIA GLX (GPU)"
                         GPU_METHOD_FOUND=1
                     else
                         echo "WARNING: NVIDIA GLX not working (got: $GLX_TEST)"
-                        echo "Trying EGL methods instead..."
-                        # Kill Xvfb and try EGL
                         kill -TERM $XVFB_PID 2>/dev/null || true
                         sleep 1
                         XVFB_PID=""
                         unset __GLX_VENDOR_LIBRARY_NAME
                     fi
                 else
-                    # No glxinfo, assume it might work
                     RENDER_MODE="Xvfb + NVIDIA GLX (GPU)"
                     GPU_METHOD_FOUND=1
                 fi
