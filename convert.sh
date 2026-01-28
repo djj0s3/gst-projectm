@@ -157,51 +157,63 @@ start_x_with_gpu() {
             fi
         fi
 
-        # Method 2: EGL-GBM (reliable headless GPU rendering)
-        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
-            echo "Trying EGL-GBM headless GPU rendering..."
+        # EGL methods are experimental and often fail with NVIDIA drivers
+        # Skip directly to Mesa for reliability - EGL can be enabled with FORCE_EGL=1
+        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "${FORCE_EGL:-0}" -eq 1 ]; then
+            # Method 2: EGL-GBM (experimental - often fails)
+            if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
+                echo "Trying EGL-GBM headless GPU rendering (experimental)..."
 
-            # EGL-GBM configuration
-            export GST_GL_PLATFORM=egl
-            export GST_GL_WINDOW=gbm
-            export GST_GL_API=opengl3
-            export GBM_DEVICE="$RENDER_NODE"
-            export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-            export __GL_SYNC_TO_VBLANK=0
-            export vblank_mode=0
-            export GST_PROJECTM_FORCE_FBO=1
+                export GST_GL_PLATFORM=egl
+                export GST_GL_WINDOW=gbm
+                export GST_GL_API=opengl3
+                export GBM_DEVICE="$RENDER_NODE"
+                export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+                export __GL_SYNC_TO_VBLANK=0
+                export vblank_mode=0
+                export GST_PROJECTM_FORCE_FBO=1
+                unset DISPLAY
 
-            RENDER_MODE="EGL-GBM (GPU)"
-            GPU_METHOD_FOUND=1
-            unset DISPLAY
+                # Test if EGL actually works with a simple GStreamer pipeline
+                if gst-launch-1.0 -e videotestsrc num-buffers=1 ! glupload ! gldownload ! fakesink 2>/dev/null; then
+                    RENDER_MODE="EGL-GBM (GPU)"
+                    GPU_METHOD_FOUND=1
+                    echo "EGL-GBM validated and working"
+                else
+                    echo "WARNING: EGL-GBM test failed, trying next method..."
+                    unset GST_GL_PLATFORM GST_GL_WINDOW GST_GL_API GBM_DEVICE GST_PROJECTM_FORCE_FBO
+                fi
+            fi
 
-            echo "EGL-GBM configured with render node: $RENDER_NODE"
-        fi
+            # Method 3: EGL-device surfaceless (experimental)
+            if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ]; then
+                echo "Trying EGL-device surfaceless rendering (experimental)..."
 
-        # Method 3: EGL-device surfaceless (fallback when DRI has issues)
-        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ]; then
-            echo "Trying EGL-device surfaceless rendering..."
+                export GST_GL_PLATFORM=egl
+                export GST_GL_WINDOW=surfaceless
+                export GST_GL_API=opengl3
+                export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+                export EGL_PLATFORM=device
+                export __GL_SYNC_TO_VBLANK=0
+                export vblank_mode=0
+                export GST_PROJECTM_FORCE_FBO=1
+                unset DISPLAY
 
-            # EGL-device configuration for surfaceless rendering
-            export GST_GL_PLATFORM=egl
-            export GST_GL_WINDOW=surfaceless
-            export GST_GL_API=opengl3
-            export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-            export EGL_PLATFORM=device
-            export __GL_SYNC_TO_VBLANK=0
-            export vblank_mode=0
-            export GST_PROJECTM_FORCE_FBO=1
-
-            RENDER_MODE="EGL-device surfaceless (GPU)"
-            GPU_METHOD_FOUND=1
-            unset DISPLAY
-
-            echo "EGL-device surfaceless configured with FBO rendering"
+                # Test if EGL surfaceless works
+                if gst-launch-1.0 -e videotestsrc num-buffers=1 ! glupload ! gldownload ! fakesink 2>/dev/null; then
+                    RENDER_MODE="EGL-device surfaceless (GPU)"
+                    GPU_METHOD_FOUND=1
+                    echo "EGL-device surfaceless validated and working"
+                else
+                    echo "WARNING: EGL-device surfaceless test failed"
+                    unset GST_GL_PLATFORM GST_GL_WINDOW GST_GL_API EGL_PLATFORM GST_PROJECTM_FORCE_FBO
+                fi
+            fi
         fi
 
         # If no GPU method worked, fall back to Mesa
         if [ "$GPU_METHOD_FOUND" -eq 0 ]; then
-            echo "No GPU rendering method worked, falling back to Mesa..."
+            echo "NVIDIA GPU methods unavailable, using Mesa software rendering..."
             USE_NVIDIA_GPU=0
         fi
     fi
