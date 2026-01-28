@@ -104,15 +104,14 @@ start_x_with_gpu() {
             fi
         fi
 
-        # Method 1: Xvfb + NVIDIA GLX (BEST - works on Vast.ai and similar platforms)
-        # This is the most reliable GPU rendering method:
+        # Track if we found a working GPU method
+        GPU_METHOD_FOUND=0
+
+        # Method 1: Xvfb + NVIDIA GLX (works on some Vast.ai configurations)
         # - Xvfb provides a virtual X server with GLX support
         # - NVIDIA GLX vendor provides hardware-accelerated OpenGL
-        # - No EGL/GBM issues, works with standard GStreamer GL pipeline
-        if [ "$HAS_NVIDIA_GLX" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
-            echo "Using Xvfb + NVIDIA GLX (recommended GPU mode)..."
-
-            RENDER_MODE="Xvfb + NVIDIA GLX (GPU)"
+        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_GLX" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
+            echo "Trying Xvfb + NVIDIA GLX..."
 
             # Start Xvfb FIRST (without NVIDIA vendor set - let it use Mesa for X server itself)
             Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
@@ -122,118 +121,87 @@ start_x_with_gpu() {
             # Wait for Xvfb to be ready
             sleep 2
             if ! kill -0 $XVFB_PID 2>/dev/null; then
-                echo "WARNING: Xvfb failed to start, trying Xorg fallback..."
+                echo "WARNING: Xvfb failed to start, trying next method..."
                 XVFB_PID=""
             else
                 # NOW set NVIDIA vendor for client applications (GStreamer, glxinfo, etc.)
-                # This makes GL client apps use NVIDIA's GLX implementation while Xvfb provides the X server
                 export GST_GL_PLATFORM=glx
                 export GST_GL_WINDOW=x11
                 export GST_GL_API=opengl3
-                # Force NVIDIA GLX vendor for client apps (critical!)
                 export __GLX_VENDOR_LIBRARY_NAME=nvidia
-                # Also set EGL vendor for any EGL fallback paths
                 export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-                # Disable vsync for headless rendering
                 export __GL_SYNC_TO_VBLANK=0
                 export vblank_mode=0
 
-                # Test if NVIDIA GLX actually works with this Xvfb + driver combo
-                # Some NVIDIA driver versions (e.g., 580.x) don't support this
+                # Test if NVIDIA GLX actually works
                 if command -v glxinfo >/dev/null 2>&1; then
                     GLX_TEST=$(glxinfo 2>&1 | grep -i "OpenGL renderer" | head -1)
                     if echo "$GLX_TEST" | grep -qi "nvidia"; then
                         echo "NVIDIA GLX confirmed working: $GLX_TEST"
+                        RENDER_MODE="Xvfb + NVIDIA GLX (GPU)"
+                        GPU_METHOD_FOUND=1
                     else
                         echo "WARNING: NVIDIA GLX not working (got: $GLX_TEST)"
-                        echo "This driver version may not support Xvfb + NVIDIA GLX"
-                        echo "Falling back to Mesa software rendering..."
-                        # Kill Xvfb and reset for Mesa fallback
+                        echo "Trying EGL methods instead..."
+                        # Kill Xvfb and try EGL
                         kill -TERM $XVFB_PID 2>/dev/null || true
                         sleep 1
                         XVFB_PID=""
-                        USE_NVIDIA_GPU=0
                         unset __GLX_VENDOR_LIBRARY_NAME
                     fi
+                else
+                    # No glxinfo, assume it might work
+                    RENDER_MODE="Xvfb + NVIDIA GLX (GPU)"
+                    GPU_METHOD_FOUND=1
                 fi
             fi
+        fi
 
-        # Method 2: Xorg dummy + NVIDIA GLX (fallback if Xvfb doesn't work)
-        elif [ "$HAS_NVIDIA_GLX" = "yes" ] && [ -n "$RENDER_NODE" ]; then
-            echo "Trying Xorg dummy + NVIDIA GLX..."
-
-            # Configure for NVIDIA GLX (hardware-accelerated OpenGL through X)
-            export GST_GL_PLATFORM=glx
-            export GST_GL_WINDOW=x11
-            export GST_GL_API=opengl3
-            # Force NVIDIA GLX vendor
-            export __GLX_VENDOR_LIBRARY_NAME=nvidia
-            export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-            # Disable vsync for headless
-            export __GL_SYNC_TO_VBLANK=0
-            export vblank_mode=0
-
-            RENDER_MODE="Xorg dummy + NVIDIA GLX (GPU)"
-
-            # Start X with dummy driver - NVIDIA GLX will use the GPU for rendering
-            XORG_CONF="/etc/X11/xorg.conf"
-            Xorg :${DISPLAY_NUM} \
-                -config "$XORG_CONF" \
-                -noreset \
-                +extension GLX \
-                +extension RANDR \
-                +extension RENDER \
-                -nolisten tcp \
-                -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
-            XORG_PID=$!
-
-        # Method 3: EGL-GBM (experimental - may not work with all NVIDIA drivers)
-        elif [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
-            echo "Trying EGL-GBM headless GPU rendering (experimental)..."
+        # Method 2: EGL-GBM (reliable headless GPU rendering)
+        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
+            echo "Trying EGL-GBM headless GPU rendering..."
 
             # EGL-GBM configuration
             export GST_GL_PLATFORM=egl
             export GST_GL_WINDOW=gbm
             export GST_GL_API=opengl3
-            # Point GBM to the render node
             export GBM_DEVICE="$RENDER_NODE"
-            # Use NVIDIA EGL
             export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-            # Disable vsync for headless
             export __GL_SYNC_TO_VBLANK=0
             export vblank_mode=0
-            # Force FBO rendering for headless EGL (no default framebuffer)
             export GST_PROJECTM_FORCE_FBO=1
 
             RENDER_MODE="EGL-GBM (GPU)"
+            GPU_METHOD_FOUND=1
             unset DISPLAY
 
             echo "EGL-GBM configured with render node: $RENDER_NODE"
+        fi
 
-        # Method 4: EGL-device surfaceless (fallback when DRI isn't accessible)
-        elif [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" != "yes" ]; then
-            echo "DRI not accessible, trying EGL-device surfaceless rendering..."
+        # Method 3: EGL-device surfaceless (fallback when DRI has issues)
+        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ]; then
+            echo "Trying EGL-device surfaceless rendering..."
 
             # EGL-device configuration for surfaceless rendering
             export GST_GL_PLATFORM=egl
             export GST_GL_WINDOW=surfaceless
             export GST_GL_API=opengl3
-            # Use NVIDIA EGL device
             export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
             export EGL_PLATFORM=device
-            # Disable vsync for headless
             export __GL_SYNC_TO_VBLANK=0
             export vblank_mode=0
-            # Force FBO rendering - essential for surfaceless EGL (no default framebuffer)
             export GST_PROJECTM_FORCE_FBO=1
 
             RENDER_MODE="EGL-device surfaceless (GPU)"
+            GPU_METHOD_FOUND=1
             unset DISPLAY
 
             echo "EGL-device surfaceless configured with FBO rendering"
+        fi
 
-        else
-            echo "NVIDIA GPU rendering not available, falling back to Mesa..."
+        # If no GPU method worked, fall back to Mesa
+        if [ "$GPU_METHOD_FOUND" -eq 0 ]; then
+            echo "No GPU rendering method worked, falling back to Mesa..."
             USE_NVIDIA_GPU=0
         fi
     fi
