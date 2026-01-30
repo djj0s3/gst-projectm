@@ -56,38 +56,30 @@ RUN git clone --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git
     make install && \
     rm -rf /tmp/nv-codec-headers
 
-# Build gst-plugins-bad from source with NVENC support
-RUN git clone --depth 1 --branch 1.22.0 https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer && \
-    cd /tmp/gstreamer && \
-    meson setup builddir \
-        --prefix=/usr \
-        --buildtype=release \
-        -Dgpl=enabled \
-        -Dgst-plugins-bad:nvcodec=enabled \
-        -Dgst-plugins-bad:v4l2codecs=disabled \
-        -Dgst-plugins-base:gl=enabled \
-        -Dgst-plugins-base:gl_platform=egl,glx \
-        -Dbad=enabled \
-        -Dgood=disabled \
-        -Dugly=disabled \
-        -Dbase=disabled \
-        -Dlibav=disabled \
-        -Ddevtools=disabled \
-        -Dges=disabled \
-        -Drtsp_server=disabled \
-        -Dgst-examples=disabled \
-        -Dtests=disabled \
-        -Dexamples=disabled \
-        -Ddoc=disabled && \
-    ninja -C builddir -j$(nproc) && \
-    ninja -C builddir install && \
-    rm -rf /tmp/gstreamer
-
-# Install remaining gstreamer plugins from packages (after our custom build)
+# Install GStreamer plugins including the bad plugins with NVENC support
+# Note: gstreamer1.0-plugins-bad includes nvcodec when CUDA is available
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-bad \
-        libgstreamer-plugins-bad1.0-dev
+        libgstreamer-plugins-bad1.0-dev \
+        gstreamer1.0-plugins-base-apps
+
+# Build just the nvcodec GStreamer plugin from gstreamer monorepo
+# This ensures we have nvh264enc for hardware encoding
+RUN pip3 install --upgrade meson && \
+    git clone --depth 1 --branch 1.20.7 https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer && \
+    cd /tmp/gstreamer/subprojects/gst-plugins-bad && \
+    meson setup builddir \
+        --prefix=/usr \
+        --buildtype=release \
+        -Dauto_features=disabled \
+        -Dnvcodec=enabled \
+        -Dgpl=enabled && \
+    ninja -C builddir && \
+    mkdir -p /usr/lib/x86_64-linux-gnu/gstreamer-1.0 && \
+    cp builddir/sys/nvcodec/libgstnvcodec.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/ 2>/dev/null || \
+    find builddir -name "libgstnvcodec.so" -exec cp {} /usr/lib/x86_64-linux-gnu/gstreamer-1.0/ \; && \
+    rm -rf /tmp/gstreamer
 
 # Clone the projectM repository and build it
 RUN git clone --depth 1 https://github.com/projectM-visualizer/projectm.git /tmp/projectm
