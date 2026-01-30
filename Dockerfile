@@ -1,12 +1,9 @@
-# Start from the official Ubuntu 24.04 image
-FROM ubuntu:24.04
+# Start from NVIDIA CUDA base image for NVENC hardware encoding support
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
 # Install required packages
-RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
-    echo 'Acquire::AllowInsecureRepositories "true";' > /etc/apt/apt.conf.d/99allow-insecure && \
-    echo 'Acquire::AllowDowngradeToInsecureRepositories "true";' >> /etc/apt/apt.conf.d/99allow-insecure && \
-    apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-unauthenticated \
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential \
         llvm \
         git \
@@ -14,16 +11,22 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
         ca-certificates \
         libssl-dev \
         curl \
+        wget \
+        pkg-config \
+        ninja-build \
+        meson \
+        flex \
+        bison \
+        nasm \
         xvfb \
         xserver-xorg-core \
         xserver-xorg-video-dummy \
         x11-xserver-utils \
         kmod \
+        libgstreamer1.0-dev \
         libgstreamer-plugins-base1.0-dev \
-        libgstreamer-plugins-bad1.0-dev \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly \
         gstreamer1.0-gl \
         gstreamer1.0-x \
@@ -37,12 +40,54 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && \
         libgbm-dev \
         libdrm2 \
         libdrm-dev \
+        libgudev-1.0-dev \
         mesa-utils \
         python3 \
         python3-pip \
         python3-venv \
         sudo \
-        openssh-server
+        openssh-server \
+        libnvidia-encode-525 \
+        libnvidia-decode-525
+
+# Download NVIDIA Video Codec SDK headers for NVENC/NVDEC
+RUN git clone --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git /tmp/nv-codec-headers && \
+    cd /tmp/nv-codec-headers && \
+    make install && \
+    rm -rf /tmp/nv-codec-headers
+
+# Build gst-plugins-bad from source with NVENC support
+RUN git clone --depth 1 --branch 1.22.0 https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer && \
+    cd /tmp/gstreamer && \
+    meson setup builddir \
+        --prefix=/usr \
+        --buildtype=release \
+        -Dgpl=enabled \
+        -Dgst-plugins-bad:nvcodec=enabled \
+        -Dgst-plugins-bad:v4l2codecs=disabled \
+        -Dgst-plugins-base:gl=enabled \
+        -Dgst-plugins-base:gl_platform=egl,glx \
+        -Dbad=enabled \
+        -Dgood=disabled \
+        -Dugly=disabled \
+        -Dbase=disabled \
+        -Dlibav=disabled \
+        -Ddevtools=disabled \
+        -Dges=disabled \
+        -Drtsp_server=disabled \
+        -Dgst-examples=disabled \
+        -Dtests=disabled \
+        -Dexamples=disabled \
+        -Ddoc=disabled && \
+    ninja -C builddir -j$(nproc) && \
+    ninja -C builddir install && \
+    rm -rf /tmp/gstreamer
+
+# Install remaining gstreamer plugins from packages (after our custom build)
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        gstreamer1.0-plugins-bad \
+        libgstreamer-plugins-bad1.0-dev
 
 # Clone the projectM repository and build it
 RUN git clone --depth 1 https://github.com/projectM-visualizer/projectm.git /tmp/projectm
@@ -85,7 +130,12 @@ RUN mkdir -p $(pkg-config --variable=pluginsdir gstreamer-1.0) && \
 RUN apt-get remove -y \
         build-essential \
         git \
-        cmake && \
+        cmake \
+        meson \
+        ninja-build \
+        flex \
+        bison \
+        nasm && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -109,13 +159,14 @@ ENV PRESETS_DIR=/usr/local/share/projectM/presets
 ENV TEXTURES_DIR=/usr/local/share/projectM/textures
 ENV XDG_RUNTIME_DIR=/tmp
 
-# Ensure GStreamer can find plugins
-ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/local/lib/gstreamer-1.0
+# Ensure GStreamer can find plugins (including NVENC from custom build)
+ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/local/lib/gstreamer-1.0:/usr/lib/gstreamer-1.0
 ENV GST_PLUGIN_SCANNER=/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
 
 # Setup for GPU access - respect Runpod's settings
 ENV LIBGL_ALWAYS_INDIRECT=0
-ENV NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-all}
+# Include 'video' capability for NVENC hardware encoding
+ENV NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,graphics,video}
 # Don't override NVIDIA_VISIBLE_DEVICES if already set by Runpod
 
 # OpenGL debugging and shader compatibility
