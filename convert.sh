@@ -60,6 +60,37 @@ gpu_accessible() {
 }
 
 start_x_with_gpu() {
+    # Use GLX through X server
+    export GST_GL_PLATFORM=glx
+    export GST_GL_WINDOW=x11
+    export GST_GL_API=opengl3
+    export GST_GL_CONFIG=rgba
+
+    # Check if an X server is already running (passed from host)
+    # This is the preferred mode when running in Docker with host X11 passthrough
+    if [ -n "$DISPLAY" ] && [ -S "/tmp/.X11-unix/X${DISPLAY#:}" ]; then
+        echo "Using existing X server at DISPLAY=$DISPLAY (host passthrough)"
+
+        # Test if it works with NVIDIA GLX
+        if command -v glxinfo >/dev/null 2>&1; then
+            GLX_TEST=$(glxinfo 2>&1 | grep -i "OpenGL renderer" | head -1)
+            echo "GLX renderer: $GLX_TEST"
+            if echo "$GLX_TEST" | grep -qiE "nvidia|amd|intel|radeon" && ! echo "$GLX_TEST" | grep -qi "llvmpipe"; then
+                echo "GPU rendering confirmed via host X server"
+                RENDER_MODE="Host X11 passthrough (GPU)"
+                return 0
+            else
+                echo "WARNING: Host X server doesn't provide GPU rendering, will try other methods..."
+            fi
+        else
+            # Assume host display works
+            echo "Assuming host X server works (glxinfo not available for test)"
+            RENDER_MODE="Host X11 passthrough"
+            return 0
+        fi
+    fi
+
+    # No working host X server, start our own
     # Use unique display number based on process ID to avoid conflicts
     DISPLAY_NUM=$((99 + ($$  % 100)))
     X_LOCK_FILE="/tmp/.X${DISPLAY_NUM}-lock"
@@ -71,12 +102,6 @@ start_x_with_gpu() {
     fi
 
     export DISPLAY=:${DISPLAY_NUM}
-
-    # Use GLX through X server
-    export GST_GL_PLATFORM=glx
-    export GST_GL_WINDOW=x11
-    export GST_GL_API=opengl3
-    export GST_GL_CONFIG=rgba
 
     # Check if we should use NVIDIA GPU rendering (set USE_NVIDIA_GPU=1 for pods)
     if [ "${USE_NVIDIA_GPU:-0}" -eq 1 ]; then
