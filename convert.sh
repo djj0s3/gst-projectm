@@ -80,6 +80,40 @@ start_x_with_gpu() {
 
     # Check if we should use NVIDIA GPU rendering (set USE_NVIDIA_GPU=1 for pods)
     if [ "${USE_NVIDIA_GPU:-0}" -eq 1 ]; then
+        echo "========================================"
+        echo "GPU ENVIRONMENT DIAGNOSTICS"
+        echo "========================================"
+
+        # Show nvidia-smi info
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "NVIDIA SMI available:"
+            nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || echo "  (query failed)"
+        else
+            echo "NVIDIA SMI: not available"
+        fi
+
+        # Check for DRI devices
+        echo ""
+        echo "DRI devices:"
+        ls -la /dev/dri/ 2>/dev/null || echo "  /dev/dri not found"
+
+        # Check for NVIDIA devices
+        echo ""
+        echo "NVIDIA devices:"
+        ls -la /dev/nvidia* 2>/dev/null || echo "  /dev/nvidia* not found"
+
+        # Check EGL vendor files
+        echo ""
+        echo "EGL vendor files:"
+        ls -la /usr/share/glvnd/egl_vendor.d/ 2>/dev/null || echo "  EGL vendor dir not found"
+
+        # Check for required libraries
+        echo ""
+        echo "GPU libraries:"
+        ldconfig -p 2>/dev/null | grep -E "(EGL|GLX)_nvidia" | head -5 || echo "  No NVIDIA GL libraries found"
+
+        echo "========================================"
+        echo ""
         echo "Attempting GPU-accelerated rendering..."
 
         # Check for DRI render node
@@ -149,13 +183,14 @@ start_x_with_gpu() {
                 if command -v glxinfo >/dev/null 2>&1; then
                     GLX_TEST=$(glxinfo 2>&1 | grep -i "OpenGL renderer" | head -1)
                     echo "GLX renderer: $GLX_TEST"
-                    # Accept NVIDIA, AMD, Intel, or llvmpipe with glamor
-                    if echo "$GLX_TEST" | grep -qiE "nvidia|amd|intel|radeon|llvmpipe"; then
+                    # Only accept real GPU renderers (NVIDIA, AMD, Intel)
+                    # Do NOT accept llvmpipe - gst-projectm outputs black frames with software rendering
+                    if echo "$GLX_TEST" | grep -qiE "nvidia|amd|intel|radeon" && ! echo "$GLX_TEST" | grep -qi "llvmpipe"; then
                         echo "GPU rendering confirmed: $GLX_TEST"
                         RENDER_MODE="Xorg modesetting (GPU)"
                         GPU_METHOD_FOUND=1
                     else
-                        echo "WARNING: No GPU renderer detected, trying other methods..."
+                        echo "WARNING: llvmpipe/software renderer detected, trying other methods..."
                         kill -TERM $XORG_PID 2>/dev/null || true
                         sleep 1
                         XORG_PID=""
@@ -168,9 +203,11 @@ start_x_with_gpu() {
             fi
         fi
 
-        # Method 2: Xvfb + NVIDIA GLX (works on some configurations)
-        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_GLX" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
-            echo "Trying Xvfb + NVIDIA GLX..."
+        # Method 2: Xvfb + NVIDIA GLX (works on Vast.ai with nvidia-drm modeset=N)
+        # This is the most reliable method - forces NVIDIA's GLX client library
+        # Works even without DRI access because rendering goes through NVIDIA driver via GLX
+        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_GLX" = "yes" ]; then
+            echo "Trying Xvfb + NVIDIA GLX (preferred method for Vast.ai)..."
 
             # Start Xvfb
             Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp -noreset &
@@ -210,87 +247,183 @@ start_x_with_gpu() {
             fi
         fi
 
-        # EGL methods are experimental and often fail with NVIDIA drivers
-        # Skip directly to Mesa for reliability - EGL can be enabled with FORCE_EGL=1
-        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "${FORCE_EGL:-0}" -eq 1 ]; then
-            # Method 2: EGL-GBM (experimental - often fails)
-            if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ] && [ "$DRI_ACCESSIBLE" = "yes" ]; then
-                echo "Trying EGL-GBM headless GPU rendering (experimental)..."
+        # EGL methods - try these if GLX methods failed
+        # Method 3: EGL with NVIDIA device (most likely to work in containers)
+        if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ]; then
+            echo "Trying EGL with NVIDIA GPU device..."
+
+            # First, check if we can enumerate EGL devices
+            if python3 -c "
+from ctypes import *
+try:
+    egl = CDLL('libEGL.so.1')
+    EGL_PLATFORM_DEVICE_EXT = 0x313F
+    EGLint = c_int32
+    EGLBoolean = c_uint32
+
+    # Try to get device list
+    eglQueryDevicesEXT = egl.eglQueryDevicesEXT
+    eglQueryDevicesEXT.argtypes = [EGLint, c_void_p, POINTER(EGLint)]
+    eglQueryDevicesEXT.restype = EGLBoolean
+
+    num = EGLint(0)
+    result = eglQueryDevicesEXT(0, None, byref(num))
+    print(f'EGL devices available: {num.value}')
+    exit(0 if num.value > 0 else 1)
+except Exception as e:
+    print(f'EGL check failed: {e}')
+    exit(1)
+" 2>/dev/null; then
+                echo "EGL devices found, configuring EGL rendering..."
 
                 export GST_GL_PLATFORM=egl
+                export GST_GL_API=opengl3
+                export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+                export __GL_SYNC_TO_VBLANK=0
+                export vblank_mode=0
+                # Force ProjectM to use FBOs for offscreen rendering
+                export GST_PROJECTM_FORCE_FBO=1
+                unset DISPLAY
+
+                # Check NVIDIA driver version for GBM support (495+ required)
+                NVIDIA_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+                echo "NVIDIA driver version: ${NVIDIA_VERSION:-unknown}"
+
+                # Check if nvidia-drm is loaded with modeset
+                if [ -f /sys/module/nvidia_drm/parameters/modeset ]; then
+                    MODESET=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)
+                    echo "nvidia-drm modeset: ${MODESET:-N/A}"
+                else
+                    echo "nvidia-drm modeset: not available (host kernel module)"
+                fi
+
+                # Use a test that actually does FBO rendering (like ProjectM does)
+                # gleffects_identity does real shader rendering to FBO
+                TEST_PIPELINE="videotestsrc num-buffers=10 ! video/x-raw,width=320,height=240 ! glupload ! glcolorconvert ! glshader fragment=\"void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\" ! glcolorconvert ! gldownload ! fakesink"
+
+                # Simpler test if glshader not available
+                SIMPLE_TEST="videotestsrc num-buffers=10 ! video/x-raw,width=320,height=240 ! glupload ! gldownload ! fakesink"
+
+                # Try GBM first - it provides a proper renderable surface
+                echo "Testing EGL-GBM with FBO rendering..."
                 export GST_GL_WINDOW=gbm
-                export GST_GL_API=opengl3
                 export GBM_DEVICE="$RENDER_NODE"
-                export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-                export __GL_SYNC_TO_VBLANK=0
-                export vblank_mode=0
-                export GST_PROJECTM_FORCE_FBO=1
-                unset DISPLAY
 
-                # Test if EGL actually works with a simple GStreamer pipeline
-                if gst-launch-1.0 -e videotestsrc num-buffers=1 ! glupload ! gldownload ! fakesink 2>/dev/null; then
-                    RENDER_MODE="EGL-GBM (GPU)"
-                    GPU_METHOD_FOUND=1
-                    echo "EGL-GBM validated and working"
+                # Test with actual GL rendering
+                EGL_GBM_OUTPUT=$(timeout 15 gst-launch-1.0 -e $SIMPLE_TEST 2>&1)
+                EGL_GBM_EXIT=$?
+
+                # Show GL context info
+                echo "$EGL_GBM_OUTPUT" | grep -i "gl.*context\|renderer\|vendor\|EGL" | head -5
+                echo "EGL-GBM test exit code: $EGL_GBM_EXIT"
+
+                if [ $EGL_GBM_EXIT -eq 0 ]; then
+                    # Verify it's actually using NVIDIA, not Mesa
+                    if echo "$EGL_GBM_OUTPUT" | grep -qi "nvidia"; then
+                        RENDER_MODE="EGL-GBM (NVIDIA GPU)"
+                        GPU_METHOD_FOUND=1
+                        echo "✅ EGL-GBM with NVIDIA GPU validated"
+                    else
+                        echo "⚠️ EGL-GBM works but using Mesa, not NVIDIA"
+                        # Still try it - might work
+                        RENDER_MODE="EGL-GBM (Mesa)"
+                        GPU_METHOD_FOUND=1
+                    fi
                 else
-                    echo "WARNING: EGL-GBM test failed, trying next method..."
-                    unset GST_GL_PLATFORM GST_GL_WINDOW GST_GL_API GBM_DEVICE GST_PROJECTM_FORCE_FBO
+                    echo "EGL-GBM failed, trying surfaceless..."
+                    echo "GBM errors: $(echo "$EGL_GBM_OUTPUT" | grep -i "error\|failed\|cannot" | head -3)"
+                    unset GBM_DEVICE
+
+                    # Try surfaceless EGL as fallback
+                    export GST_GL_WINDOW=surfaceless
+                    export EGL_PLATFORM=device
+
+                    EGL_TEST_OUTPUT=$(timeout 15 gst-launch-1.0 -e $SIMPLE_TEST 2>&1)
+                    EGL_TEST_EXIT=$?
+
+                    echo "$EGL_TEST_OUTPUT" | grep -i "gl.*context\|renderer\|vendor\|EGL" | head -5
+                    echo "EGL surfaceless test exit code: $EGL_TEST_EXIT"
+
+                    if [ $EGL_TEST_EXIT -eq 0 ]; then
+                        if echo "$EGL_TEST_OUTPUT" | grep -qi "nvidia"; then
+                            RENDER_MODE="EGL surfaceless (NVIDIA GPU)"
+                            GPU_METHOD_FOUND=1
+                            echo "✅ EGL surfaceless with NVIDIA GPU validated"
+                        else
+                            echo "⚠️ EGL surfaceless works but using Mesa"
+                            RENDER_MODE="EGL surfaceless (Mesa)"
+                            GPU_METHOD_FOUND=1
+                        fi
+                    else
+                        echo "❌ All EGL methods failed"
+                        echo "Surfaceless errors: $(echo "$EGL_TEST_OUTPUT" | grep -i "error\|failed\|cannot" | head -3)"
+                        unset GST_GL_PLATFORM GST_GL_WINDOW GST_GL_API EGL_PLATFORM GST_PROJECTM_FORCE_FBO
+                    fi
                 fi
-            fi
-
-            # Method 3: EGL-device surfaceless (experimental)
-            if [ "$GPU_METHOD_FOUND" -eq 0 ] && [ "$HAS_NVIDIA_EGL" = "yes" ]; then
-                echo "Trying EGL-device surfaceless rendering (experimental)..."
-
-                export GST_GL_PLATFORM=egl
-                export GST_GL_WINDOW=surfaceless
-                export GST_GL_API=opengl3
-                export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-                export EGL_PLATFORM=device
-                export __GL_SYNC_TO_VBLANK=0
-                export vblank_mode=0
-                export GST_PROJECTM_FORCE_FBO=1
-                unset DISPLAY
-
-                # Test if EGL surfaceless works
-                if gst-launch-1.0 -e videotestsrc num-buffers=1 ! glupload ! gldownload ! fakesink 2>/dev/null; then
-                    RENDER_MODE="EGL-device surfaceless (GPU)"
-                    GPU_METHOD_FOUND=1
-                    echo "EGL-device surfaceless validated and working"
-                else
-                    echo "WARNING: EGL-device surfaceless test failed"
-                    unset GST_GL_PLATFORM GST_GL_WINDOW GST_GL_API EGL_PLATFORM GST_PROJECTM_FORCE_FBO
-                fi
+            else
+                echo "No EGL devices found, skipping EGL"
             fi
         fi
 
-        # If no GPU method worked, fall back to Mesa
+        # If no GPU method worked, fall back to Mesa software rendering
+        # NOTE: This is common on Vast.ai where nvidia-drm modeset=N prevents GPU OpenGL.
+        # WARNING: Mesa llvmpipe produces BLACK FRAMES with gst-projectm plugin!
+        # However, NVENC hardware encoding (nvh264enc) may still work - it's independent of GL.
         if [ "$GPU_METHOD_FOUND" -eq 0 ]; then
-            echo "NVIDIA GPU methods unavailable, using Mesa software rendering..."
+            echo ""
+            echo "❌ CRITICAL: No GPU OpenGL method found!"
+            echo "   All tested methods:"
+            echo "   - Method 1 (Xorg modesetting): ${XORG_PID:+tried}${XORG_PID:-not available}"
+            echo "   - Method 2 (Xvfb + NVIDIA GLX): requires nvidia GLX libs + DRI access"
+            echo "   - Method 3 (EGL): requires nvidia-drm modeset=1"
+            echo ""
+            echo "⚠️  WARNING: Mesa llvmpipe produces BLACK FRAMES with gst-projectm!"
+            echo "   The output video will likely be all black."
+            echo "   To fix: Use a host with nvidia-drm modeset=Y"
+            echo "           or ensure NVIDIA GLX libraries are properly configured."
             USE_NVIDIA_GPU=0
+            export MESA_FALLBACK=1
         fi
     fi
 
     # Fallback to Mesa if USE_NVIDIA_GPU is 0 or was reset above
     if [ "${USE_NVIDIA_GPU:-0}" -eq 0 ]; then
-        echo "Starting X server with dummy driver and Mesa software rendering..."
-        # Use dummy driver with Mesa software rendering (v35 stable fallback)
-        XORG_CONF="/etc/X11/xorg.conf"
-        RENDER_MODE="Mesa software GL"
-        # Force Mesa software rendering for X server only to prevent NVIDIA library conflicts
-        LIBGL_ALWAYS_SOFTWARE=1 \
-        GALLIUM_DRIVER=llvmpipe \
-        __GLX_VENDOR_LIBRARY_NAME=mesa \
-        __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
-        Xorg :${DISPLAY_NUM} \
-            -config "$XORG_CONF" \
-            -noreset \
-            +extension GLX \
-            +extension RANDR \
-            +extension RENDER \
-            -nolisten tcp \
-            -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
-        XORG_PID=$!
+        echo "Starting virtual display with Mesa software rendering..."
+        export MESA_FALLBACK=1
+        RENDER_MODE="Mesa llvmpipe (CPU)"
+
+        # Force Mesa software rendering for consistent behavior
+        export LIBGL_ALWAYS_SOFTWARE=1
+        export GALLIUM_DRIVER=llvmpipe
+        export __GLX_VENDOR_LIBRARY_NAME=mesa
+        export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+        export GST_GL_PLATFORM=glx
+        export GST_GL_WINDOW=x11
+        export GST_GL_API=opengl3
+
+        # Use Xvfb for simpler, more reliable headless rendering
+        Xvfb :${DISPLAY_NUM} -screen 0 ${VIDEO_WIDTH}x${VIDEO_HEIGHT}x24 +extension GLX +render -nolisten tcp &
+        XVFB_PID=$!
+        echo "Started Xvfb on display :${DISPLAY_NUM} (PID: $XVFB_PID)"
+        sleep 2
+
+        if ! kill -0 $XVFB_PID 2>/dev/null; then
+            echo "ERROR: Xvfb failed to start"
+            # Fall back to Xorg with dummy driver
+            echo "Trying Xorg with dummy driver..."
+            XORG_CONF="/etc/X11/xorg.conf"
+            Xorg :${DISPLAY_NUM} \
+                -config "$XORG_CONF" \
+                -noreset \
+                +extension GLX \
+                +extension RANDR \
+                +extension RENDER \
+                -nolisten tcp \
+                -logfile /tmp/Xorg.${DISPLAY_NUM}.log &
+            XORG_PID=$!
+            XVFB_PID=""
+            sleep 2
+        fi
     fi
 
     # Only check X server if we started one (not for EGL-GBM or surfaceless)
@@ -386,21 +519,26 @@ set_auto_mesh() {
     local width=$1
     local height=$2
 
-    local auto_x=$((width / 16))
-    local auto_y=$((height / 16))
+    # Reduced mesh size for better performance on software/hybrid rendering
+    # Higher mesh = more detail but slower rendering
+    # Lower mesh = faster rendering, still looks good
+    local auto_x=$((width / 24))
+    local auto_y=$((height / 24))
 
-    if [ $auto_x -lt 64 ]; then
-        auto_x=64
+    # Lower minimums for faster rendering (48x27 works well)
+    if [ $auto_x -lt 48 ]; then
+        auto_x=48
     fi
-    if [ $auto_y -lt 36 ]; then
-        auto_y=36
+    if [ $auto_y -lt 27 ]; then
+        auto_y=27
     fi
 
-    if [ $auto_x -gt 192 ]; then
-        auto_x=192
+    # Lower maximums to prevent excessive mesh on high-res
+    if [ $auto_x -gt 96 ]; then
+        auto_x=96
     fi
-    if [ $auto_y -gt 108 ]; then
-        auto_y=108
+    if [ $auto_y -gt 54 ]; then
+        auto_y=54
     fi
 
     MESH_X=$auto_x
@@ -420,12 +558,29 @@ select_best_encoder() {
         return
     fi
 
-    if [ "$use_gpu" -eq 1 ]; then
-        if command -v nvidia-smi >/dev/null 2>&1 && gst_plugin_available nvh264enc; then
+    # Check for NVIDIA hardware encoding first
+    # NVENC (nvh264enc) uses dedicated video encoding hardware that's independent of GL rendering.
+    # It works even with Mesa software rendering because it creates its own CUDA context.
+    # This is the OPTIMAL configuration on Vast.ai where nvidia-drm modeset=N:
+    #   - Mesa llvmpipe for OpenGL rendering (CPU-based, reliable)
+    #   - nvh264enc for video encoding (GPU NVENC hardware, fast)
+    if command -v nvidia-smi >/dev/null 2>&1 && gst_plugin_available nvh264enc; then
+        # Quick test that nvh264enc can actually initialize
+        # Note: nvh264enc requires minimum resolution 145x49, so we test with 320x240
+        if timeout 5 gst-launch-1.0 -e videotestsrc num-buffers=1 ! video/x-raw,width=320,height=240 ! videoconvert ! "video/x-raw,format=NV12" ! queue ! nvh264enc ! fakesink 2>/dev/null; then
+            echo "Using nvh264enc (NVIDIA hardware encoding)"
+            if [ "${MESA_FALLBACK:-0}" = "1" ]; then
+                echo "  Note: Hybrid mode - Mesa GL rendering + NVENC hardware encoding"
+            fi
             ENCODER="nvh264"
             return
+        else
+            echo "nvh264enc available but test failed, trying alternatives..."
         fi
+    fi
 
+    # Other hardware encoders (if GPU mode requested)
+    if [ "$use_gpu" -eq 1 ]; then
         if gst_plugin_available vaapih264enc; then
             ENCODER="vaapih264"
             return
@@ -437,6 +592,8 @@ select_best_encoder() {
         fi
     fi
 
+    # Fall back to software encoding
+    echo "Using x264 (software encoding)"
     ENCODER="x264"
 }
 
@@ -676,6 +833,20 @@ if [ ! -z "$TIMELINE_FILE" ]; then
     echo "Timeline: $TIMELINE_FILE"
     if [ ! -f "$TIMELINE_FILE" ]; then
         echo "  WARNING: Timeline file does not exist!"
+    else
+        echo "  Timeline file contents (first 20 lines):"
+        head -20 "$TIMELINE_FILE" | sed 's/^/    /'
+
+        # Check if preset paths in timeline actually exist
+        echo "  Checking preset paths in timeline:"
+        grep -E "^preset\s*=" "$TIMELINE_FILE" | head -5 | while read line; do
+            preset_path=$(echo "$line" | sed 's/preset\s*=\s*//')
+            if [ -f "$preset_path" ]; then
+                echo "    ✓ $preset_path"
+            else
+                echo "    ✗ MISSING: $preset_path"
+            fi
+        done
     fi
 fi
 
@@ -708,6 +879,69 @@ else
 fi
 PROJECTM_ARGS+=("mesh-size=${MESH_X},${MESH_Y}")
 
+echo ""
+echo "=== ProjectM Pre-flight Check ==="
+echo "PROJECTM_ARGS: ${PROJECTM_ARGS[@]}"
+echo "GPU mode (use_gpu): $use_gpu"
+
+# Quick test: render a few frames with ProjectM to verify the FULL pipeline works
+# This catches GL issues that glxinfo misses
+echo "Testing ProjectM with current GL context..."
+TEST_PNG="/tmp/projectm_test_$$.png"
+PREFLIGHT_FAILED=0
+
+# Build test pipeline matching actual render pipeline
+if [ "$use_gpu" -eq 1 ]; then
+    # GPU mode: projectm outputs GL textures, need gldownload
+    echo "  Testing GPU pipeline (with gldownload)..."
+    TEST_PIPELINE="audiotestsrc num-buffers=30 ! audioconvert ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! projectm preset=$PRESET_PATH mesh-size=32,24 ! gldownload ! videoconvert ! video/x-raw,width=320,height=240 ! pngenc ! filesink location=$TEST_PNG"
+else
+    # CPU/Mesa mode: projectm outputs raw video
+    echo "  Testing CPU/Mesa pipeline..."
+    TEST_PIPELINE="audiotestsrc num-buffers=30 ! audioconvert ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! projectm preset=$PRESET_PATH mesh-size=32,24 ! video/x-raw,width=320,height=240,framerate=30/1 ! videoconvert ! pngenc ! filesink location=$TEST_PNG"
+fi
+
+if timeout 15 gst-launch-1.0 -e $TEST_PIPELINE 2>&1; then
+    if [ -f "$TEST_PNG" ] && [ -s "$TEST_PNG" ]; then
+        PNG_SIZE=$(stat -c%s "$TEST_PNG" 2>/dev/null || stat -f%z "$TEST_PNG")
+        echo "✓ ProjectM test render succeeded ($PNG_SIZE bytes)"
+        # A very small PNG (< 1KB) might indicate all-black output
+        if [ "$PNG_SIZE" -lt 1000 ]; then
+            echo "⚠️ Warning: Test output is suspiciously small, might be black"
+            PREFLIGHT_FAILED=1
+        fi
+        rm -f "$TEST_PNG"
+    else
+        echo "⚠️ ProjectM test render produced empty output"
+        PREFLIGHT_FAILED=1
+    fi
+else
+    echo "⚠️ ProjectM test render failed or timed out"
+    PREFLIGHT_FAILED=1
+fi
+
+# If GPU mode test failed, do NOT fall back to Mesa - it produces black frames!
+if [ "$PREFLIGHT_FAILED" -eq 1 ] && [ "$use_gpu" -eq 1 ]; then
+    echo ""
+    echo "❌ GPU preflight test failed!"
+    echo ""
+    echo "⚠️  IMPORTANT: Mesa/llvmpipe fallback is NOT viable for gst-projectm."
+    echo "   The gst-projectm plugin outputs BLACK FRAMES with software rendering."
+    echo ""
+    echo "   The rendering will proceed but will likely produce black video."
+    echo "   To fix this, ensure the Vast.ai/RunPod host has:"
+    echo "   1. NVIDIA GLX libraries accessible"
+    echo "   2. DRI render node access (/dev/dri/renderD*)"
+    echo "   3. Or nvidia-drm modeset=Y for proper EGL support"
+    echo ""
+    # Don't fall back to Mesa - just warn and continue
+    # The NVIDIA GLX method may still work even if preflight failed
+    export MESA_FALLBACK=1
+fi
+
+echo "==================================="
+echo ""
+
 KEY_INT=$((FRAMERATE * 2))
 GL_DOWNLOAD_PIPELINE=""
 if [ "$use_gpu" -eq 1 ] || [ "$FORCE_GL_DOWNLOAD" -eq 1 ]; then
@@ -718,7 +952,9 @@ if [ "$use_gpu" -eq 1 ] || [ "$FORCE_GL_DOWNLOAD" -eq 1 ]; then
 fi
 case "$ENCODER" in
     x264)
-        ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! x264enc bitrate=$BITRATE speed-preset=$SPEED_PRESET key-int-max=$KEY_INT threads=0"
+        # Force I420 (yuv420p) format for QuickTime compatibility
+        # Without this, x264 may encode in High 4:4:4 profile with yuv444p which QuickTime can't play
+        ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=I420,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! x264enc bitrate=$BITRATE speed-preset=$SPEED_PRESET key-int-max=$KEY_INT threads=0"
         ;;
 nvh264)
         ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! nvh264enc bitrate=$BITRATE preset=hp rc-mode=cbr-hq gop-size=$KEY_INT"

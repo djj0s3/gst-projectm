@@ -1,4 +1,5 @@
 #include <projectM-4/parameters.h>
+#include <projectM-4/render_opengl.h>
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -1362,10 +1363,16 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
     glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
   }
 
-  projectm_opengl_render_frame(plugin->priv->handle);
+  /* Use FBO-specific render function when we have an FBO, otherwise use default */
+  if (using_fbo && plugin->priv->fbo_id != 0) {
+    projectm_opengl_render_frame_fbo(plugin->priv->handle, plugin->priv->fbo_id);
+    GST_LOG_OBJECT(plugin, "Rendered frame to FBO %u", plugin->priv->fbo_id);
+  } else {
+    projectm_opengl_render_frame(plugin->priv->handle);
+  }
   gl_error_handler(glav->context, plugin);
 
-  /* Ensure FBO is still bound for ReadPixels (ProjectM may have unbound it) */
+  /* Ensure FBO is still bound for ReadPixels */
   if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
     glFunctions->BindFramebuffer(GL_FRAMEBUFFER, plugin->priv->fbo_id);
   }
