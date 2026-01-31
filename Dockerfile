@@ -48,7 +48,20 @@ RUN apt-get update && \
         sudo \
         openssh-server \
         libnvidia-encode-525 \
-        libnvidia-decode-525
+        libnvidia-decode-525 && \
+    # Install NVIDIA OpenGL libraries (for EGL/GLX support)
+    # Try multiple versions in case specific version isn't available
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libnvidia-gl-535 2>/dev/null || \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libnvidia-gl-525 2>/dev/null || \
+    echo "Note: NVIDIA GL libraries not installed (will rely on nvidia-container-toolkit)"
+
+# Create NVIDIA EGL vendor file for proper GPU detection
+# This tells libglvnd to use NVIDIA's EGL implementation
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
+    echo '{"file_format_version": "1.0.0", "ICD": {"library_path": "libEGL_nvidia.so.0"}}' \
+    > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 
 # Download NVIDIA Video Codec SDK headers for NVENC/NVDEC
 RUN git clone --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git /tmp/nv-codec-headers && \
