@@ -46,10 +46,14 @@ RUN apt-get update && \
         python3-pip \
         python3-venv \
         sudo \
-        openssh-server \
-        libnvidia-encode-525 \
-        libnvidia-decode-525 && \
-    # Install NVIDIA OpenGL libraries (for EGL/GLX support)
+        openssh-server && \
+    # NOTE: Do NOT install libnvidia-encode or libnvidia-decode here!
+    # These get baked in with a specific driver version (e.g., 525) which conflicts
+    # with the host's driver (e.g., 570) and causes NVENC to fail.
+    # nvidia-container-toolkit will inject the correct matching libraries at runtime
+    # when NVIDIA_DRIVER_CAPABILITIES=video is set.
+    #
+    # Install NVIDIA OpenGL libraries for ProjectM rendering (EGL/GLX support)
     # Try multiple versions in case specific version isn't available
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libnvidia-gl-535 2>/dev/null || \
