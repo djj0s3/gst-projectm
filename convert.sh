@@ -903,6 +903,8 @@ else
     PROJECTM_ARGS+=("preset-duration=$PRESET_DURATION")
 fi
 PROJECTM_ARGS+=("mesh-size=${MESH_X},${MESH_Y}")
+# Disable easter egg (W logo that appears at startup)
+PROJECTM_ARGS+=("easter-egg=0")
 
 echo ""
 echo "=== ProjectM Pre-flight Check ==="
