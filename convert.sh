@@ -1029,7 +1029,7 @@ gst-launch-1.0 -e \
       t. ! $VIDEO_QUEUE_OPTS ! projectm ${PROJECTM_ARGS[@]} ! \
             ${ENCODER_PIPELINE} ! \
             ${H264_POST_ENCODE_PIPELINE} ! queue ! mux. \
-    mp4mux name=mux ! filesink location="$OUTPUT_FILE" &
+    mp4mux name=mux faststart=true ! filesink location="$OUTPUT_FILE" &
 
 GST_PID=$!
 
