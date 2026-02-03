@@ -114,6 +114,9 @@ RUN rm -rf /tmp/projectm
 COPY presets /usr/local/share/projectM/presets
 COPY textures /usr/local/share/projectM/textures
 
+# Copy VJ Studio logo for "Made With" overlay
+COPY vj_studio_logo.png /app/vj_studio_logo.png
+
 # Install Python dependencies for RunPod serverless handler support (PEP 668 compliant)
 RUN python3 -m venv /opt/runpod-env
 ENV VIRTUAL_ENV=/opt/runpod-env

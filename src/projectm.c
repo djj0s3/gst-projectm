@@ -110,13 +110,19 @@ projectm_handle projectm_init(GstProjectM *plugin) {
   // Set preset duration, or set to in infinite duration if zero
   if (plugin->preset_duration > 0.0 && playlist != NULL) {
     projectm_set_preset_duration(handle, plugin->preset_duration);
-
-    // kick off the first preset
-    if (projectm_playlist_size(playlist) > 1 && !plugin->preset_locked) {
-      projectm_playlist_play_next(playlist, true);
-    }
   } else {
     projectm_set_preset_duration(handle, 999999.0);
+  }
+
+  // IMPORTANT: Always kick off the first preset immediately to avoid showing
+  // the built-in "idle" preset with the M logo
+  if (playlist != NULL && projectm_playlist_size(playlist) >= 1 && !plugin->preset_locked) {
+    GST_INFO("Loading first preset immediately to avoid idle screen");
+    projectm_playlist_play_next(playlist, true);
+  } else if (timeline_active) {
+    // For timeline mode, load the first preset directly
+    GST_INFO("Timeline mode: loading first preset immediately to avoid idle screen");
+    gst_projectm_load_first_timeline_preset(plugin, handle);
   }
 
   projectm_set_mesh_size(handle, plugin->mesh_width, plugin->mesh_height);

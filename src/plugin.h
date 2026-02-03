@@ -3,6 +3,7 @@
 
 #include "gstglbaseaudiovisualizer.h"
 #include <gst/gst.h>
+#include <projectM-4/projectM.h>
 
 typedef struct _GstProjectMPrivate GstProjectMPrivate;
 
@@ -64,6 +65,9 @@ static gboolean plugin_init(GstPlugin *plugin);
 static gboolean gst_projectm_setup(GstGLBaseAudioVisualizer *glav);
 
 gboolean gst_projectm_timeline_is_active(GstProjectM *plugin);
+
+/* Load the first preset from timeline immediately to avoid showing the idle preset */
+void gst_projectm_load_first_timeline_preset(GstProjectM *plugin, projectm_handle handle);
 
 G_END_DECLS
 

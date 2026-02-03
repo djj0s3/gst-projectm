@@ -431,12 +431,17 @@ static void gst_projectm_activate_timeline(GstProjectM *plugin) {
     projectm_set_preset_duration(priv->handle, 999999.0);
   }
 
-  priv->current_timeline_index = -1;
+  /* If gst_projectm_load_first_timeline_preset already loaded the first preset,
+   * keep current_timeline_index at 0 to avoid reloading with smooth transition.
+   * This prevents the idle preset from appearing during transition animation. */
+  if (priv->current_timeline_index != 0) {
+    priv->current_timeline_index = -1;
+    GST_DEBUG_OBJECT(plugin, "Timeline activated, will load first preset");
+    gst_projectm_timeline_update(plugin, 0.0);
+  } else {
+    GST_DEBUG_OBJECT(plugin, "Timeline activated, first preset already loaded");
+  }
   priv->timeline_initialized = TRUE;
-
-  GST_DEBUG_OBJECT(plugin, "Timeline activated");
-
-  gst_projectm_timeline_update(plugin, 0.0);
 }
 
 static void gst_projectm_timeline_update(GstProjectM *plugin,
@@ -909,6 +914,45 @@ gboolean gst_projectm_timeline_is_active(GstProjectM *plugin) {
   GstProjectMPrivate *priv = plugin->priv;
   return priv->timeline_active && priv->timeline_entries != NULL &&
          priv->timeline_entries->len > 0;
+}
+
+void gst_projectm_load_first_timeline_preset(GstProjectM *plugin, projectm_handle handle) {
+  if (plugin == NULL || handle == NULL) {
+    return;
+  }
+
+  GstProjectMPrivate *priv = plugin->priv;
+  if (!priv->timeline_active || priv->timeline_entries == NULL ||
+      priv->timeline_entries->len == 0) {
+    return;
+  }
+
+  // Get the first timeline entry
+  GstProjectMTimelineEntry *entry =
+      g_ptr_array_index(priv->timeline_entries, 0);
+  if (entry == NULL || entry->preset == NULL) {
+    return;
+  }
+
+  // Resolve the preset path
+  gchar *resolved = gst_projectm_resolve_preset_path(plugin, entry->preset);
+  if (resolved == NULL) {
+    GST_WARNING_OBJECT(plugin,
+                       "Unable to resolve first timeline preset path: %s",
+                       entry->preset);
+    return;
+  }
+
+  GST_INFO_OBJECT(plugin,
+                  "Loading first timeline preset immediately to avoid idle screen: %s",
+                  resolved);
+
+  // Load the preset with immediate (non-smooth) transition to avoid blending with idle
+  projectm_load_preset_file(handle, resolved, FALSE);
+  g_free(resolved);
+
+  // Mark that we're at timeline index 0
+  priv->current_timeline_index = 0;
 }
 
 void gst_projectm_set_property(GObject *object, guint property_id,
