@@ -106,6 +106,7 @@ struct _GstProjectMPrivate {
 
   GstClockTime first_frame_time;
   gboolean first_frame_received;
+  guint64 render_frame_count;
 
   GPtrArray *timeline_entries;
   gint current_timeline_index;
@@ -487,9 +488,9 @@ static void gst_projectm_timeline_update(GstProjectM *plugin,
 
   GST_INFO_OBJECT(plugin,
                   "Timeline switch -> preset=%s index=%d start=%.2f duration=%.2f "
-                  "smooth=%d",
+                  "elapsed=%.3f smooth=%d",
                   resolved, target_index, entry->start_time, entry->duration,
-                  smooth_transition);
+                  elapsed_seconds, smooth_transition);
 
   projectm_load_preset_file(priv->handle, resolved, smooth_transition);
   g_free(resolved);
@@ -1125,6 +1126,7 @@ static void gst_projectm_init(GstProjectM *plugin) {
   plugin->priv->timeline_initialized = FALSE;
   plugin->priv->first_frame_received = FALSE;
   plugin->priv->first_frame_time = GST_CLOCK_TIME_NONE;
+  plugin->priv->render_frame_count = 0;
 
   // Set default values for properties
   plugin->preset_path = DEFAULT_PRESET_PATH;
@@ -1351,6 +1353,21 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
   projectm_set_frame_time(plugin->priv->handle, seconds_since_first_frame);
 
   gst_projectm_timeline_update(plugin, seconds_since_first_frame);
+
+  // PTS diagnostic: log audio vs video PTS every 600 frames (~10s at 60fps)
+  plugin->priv->render_frame_count++;
+  if (plugin->priv->render_frame_count % 600 == 0) {
+    GstClockTime audio_pts = GST_BUFFER_PTS(audio);
+    GstClockTime video_pts = GST_BUFFER_PTS(video->buffer);
+    GST_INFO_OBJECT(plugin,
+                    "PTS diagnostic frame=%lu audio_pts=%.3f video_pts=%.3f "
+                    "elapsed=%.3f timeline_idx=%d",
+                    (unsigned long)plugin->priv->render_frame_count,
+                    (double)audio_pts / GST_SECOND,
+                    (double)video_pts / GST_SECOND,
+                    seconds_since_first_frame,
+                    plugin->priv->current_timeline_index);
+  }
 
   // AUDIO
   gst_buffer_map(audio, &audioMap, GST_MAP_READ);
