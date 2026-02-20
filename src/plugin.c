@@ -155,10 +155,13 @@ static void gst_projectm_timeline_entry_free(gpointer data) {
 
 static gint gst_projectm_timeline_entry_compare(gconstpointer a,
                                                 gconstpointer b) {
+  /* g_ptr_array_sort passes pointers-to-pointers: each argument is the
+     address of a slot in the GPtrArray, so we must dereference once to
+     obtain the actual GstProjectMTimelineEntry*. */
   const GstProjectMTimelineEntry *left =
-      (const GstProjectMTimelineEntry *)a;
+      *(const GstProjectMTimelineEntry *const *)a;
   const GstProjectMTimelineEntry *right =
-      (const GstProjectMTimelineEntry *)b;
+      *(const GstProjectMTimelineEntry *const *)b;
 
   if (left->start_time < right->start_time) {
     return -1;
