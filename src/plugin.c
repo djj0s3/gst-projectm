@@ -400,6 +400,15 @@ static gboolean gst_projectm_load_timeline(GstProjectM *plugin,
   GST_INFO_OBJECT(plugin, "Timeline ready with %u segments",
                   priv->timeline_entries->len);
 
+  /* Diagnostic: print first 20 entries to verify sort order */
+  for (guint di = 0; di < priv->timeline_entries->len && di < 20; di++) {
+    GstProjectMTimelineEntry *de =
+        g_ptr_array_index(priv->timeline_entries, di);
+    GST_INFO_OBJECT(plugin,
+                    "Timeline entry[%u]: start=%.3f duration=%.3f end=%.3f",
+                    di, de->start_time, de->duration, de->end_time);
+  }
+
   return TRUE;
 }
 
