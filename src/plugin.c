@@ -106,6 +106,8 @@ struct _GstProjectMPrivate {
 
   GstClockTime first_frame_time;
   gboolean first_frame_received;
+  GstClockTime first_audio_time;
+  gboolean first_audio_received;
   guint64 render_frame_count;
 
   GPtrArray *timeline_entries;
@@ -1126,6 +1128,8 @@ static void gst_projectm_init(GstProjectM *plugin) {
   plugin->priv->timeline_initialized = FALSE;
   plugin->priv->first_frame_received = FALSE;
   plugin->priv->first_frame_time = GST_CLOCK_TIME_NONE;
+  plugin->priv->first_audio_received = FALSE;
+  plugin->priv->first_audio_time = GST_CLOCK_TIME_NONE;
   plugin->priv->render_frame_count = 0;
 
   // Set default values for properties
@@ -1339,6 +1343,28 @@ static double get_seconds_since_first_frame(GstProjectM *plugin,
   return elapsed_seconds;
 }
 
+/**
+ * get_audio_elapsed_seconds:
+ *
+ * Returns elapsed seconds based on AUDIO buffer PTS.
+ * Audio PTS is the authoritative clock for timeline decisions because it
+ * advances at the true audio playback rate regardless of video encoding speed.
+ * When CPU encoding is used (x264enc fallback), video PTS can run at 0.5-0.7x
+ * of audio time, causing timeline entries to be skipped if video PTS is used.
+ */
+static double get_audio_elapsed_seconds(GstProjectM *plugin, GstBuffer *audio) {
+  if (!plugin->priv->first_audio_received) {
+    plugin->priv->first_audio_time = GST_BUFFER_PTS(audio);
+    plugin->priv->first_audio_received = TRUE;
+    return 0.0;
+  }
+
+  GstClockTime current_time = GST_BUFFER_PTS(audio);
+  GstClockTime elapsed_time = current_time - plugin->priv->first_audio_time;
+
+  return (gdouble)elapsed_time / GST_SECOND;
+}
+
 // TODO: CLEANUP & ADD DEBUGGING
 static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
                                     GstBuffer *audio, GstVideoFrame *video) {
@@ -1347,25 +1373,27 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
   GstMapInfo audioMap;
   gboolean result = TRUE;
 
-  // get current gst (PTS) time and set projectM time
-  double seconds_since_first_frame =
-      get_seconds_since_first_frame(plugin, video);
-  projectm_set_frame_time(plugin->priv->handle, seconds_since_first_frame);
+  // Use audio PTS as the authoritative clock for timeline decisions.
+  // Audio PTS advances at the true playback rate regardless of video encoding
+  // speed. Video PTS can drift when CPU encoding (x264enc) is used as fallback.
+  double audio_elapsed = get_audio_elapsed_seconds(plugin, audio);
+  double video_elapsed = get_seconds_since_first_frame(plugin, video);
 
-  gst_projectm_timeline_update(plugin, seconds_since_first_frame);
+  // Set projectM time from audio PTS so animations sync to audio, not encoding speed
+  projectm_set_frame_time(plugin->priv->handle, audio_elapsed);
+
+  // Timeline switching uses audio PTS to ensure all entries are visited
+  gst_projectm_timeline_update(plugin, audio_elapsed);
 
   // PTS diagnostic: log audio vs video PTS every 600 frames (~10s at 60fps)
   plugin->priv->render_frame_count++;
   if (plugin->priv->render_frame_count % 600 == 0) {
-    GstClockTime audio_pts = GST_BUFFER_PTS(audio);
-    GstClockTime video_pts = GST_BUFFER_PTS(video->buffer);
     GST_INFO_OBJECT(plugin,
-                    "PTS diagnostic frame=%lu audio_pts=%.3f video_pts=%.3f "
-                    "elapsed=%.3f timeline_idx=%d",
+                    "PTS diagnostic frame=%lu audio_elapsed=%.3f "
+                    "video_elapsed=%.3f ratio=%.3f timeline_idx=%d",
                     (unsigned long)plugin->priv->render_frame_count,
-                    (double)audio_pts / GST_SECOND,
-                    (double)video_pts / GST_SECOND,
-                    seconds_since_first_frame,
+                    audio_elapsed, video_elapsed,
+                    video_elapsed > 0.001 ? audio_elapsed / video_elapsed : 0.0,
                     plugin->priv->current_timeline_index);
   }
 
