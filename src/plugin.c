@@ -139,7 +139,7 @@ G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
                         GST_TYPE_GL_BASE_AUDIO_VISUALIZER,
                         G_ADD_PRIVATE(GstProjectM)
                             GST_DEBUG_CATEGORY_INIT(gst_projectm_debug,
-                                                    "gstprojectm", 0,
+                                                    "projectm", 0,
                                                     "Plugin Root"));
 
 static void gst_projectm_timeline_entry_free(gpointer data) {
