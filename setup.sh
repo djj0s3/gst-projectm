@@ -107,7 +107,7 @@ prompt_install_dependencies() {
             #     install_packages $AUTO "$SELECTED_PACKAGE_MANAGER" PACKAGE_LIST[@]
             # ;;
             brew)
-                PACKAGE_LIST=("git" "cmake" "ninja" "pkg-config" "gstreamer")
+                PACKAGE_LIST=("git" "cmake" "ninja" "pkg-config" "gstreamer" "gst-plugins-base" "gst-plugins-good" "gst-plugins-bad" "ffmpeg")
                 install_packages $AUTO "$SELECTED_PACKAGE_MANAGER" PACKAGE_LIST[@]
             ;;
         esac

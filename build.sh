@@ -116,13 +116,24 @@ prompt_install() {
 # Main
 
 # Check if environment variables are set, if needed
-if [ -d "/usr/local/include/projectM-4" ] ; then
+# Check Apple Silicon and local install paths first, then Intel Homebrew/system paths
+if [ -d "$HOME/.local/include/projectM-4" ] ; then
+    export PROJECTM_ROOT="$HOME/.local"
+elif [ -d "/opt/homebrew/include/projectM-4" ] ; then
+    export PROJECTM_ROOT="/opt/homebrew"
+elif [ -d "/usr/local/include/projectM-4" ] ; then
     export PROJECTM_ROOT="/usr/local"
 else
     if [ -z "$PROJECTM_ROOT" ] ; then
         echo "PROJECTM_ROOT environment variable is not set!"
+        echo "Install ProjectM 4: https://github.com/projectM-visualizer/projectm"
         exit 1
     fi
+fi
+
+# Ensure PKG_CONFIG_PATH includes ProjectM and GStreamer paths on macOS
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 fi
 
 AUTO=false
