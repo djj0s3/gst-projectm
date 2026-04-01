@@ -1,9 +1,23 @@
 #!/bin/bash
 set -e
 
-# Default values
-PRESET_PATH="/usr/local/share/projectM/presets"
-TEXTURE_DIR="/usr/local/share/projectM/textures"
+# Default values — detect platform-appropriate paths
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS: check ~/.local first (source builds), then Homebrew paths
+    if [ -d "$HOME/.local/share/projectM/presets" ]; then
+        PRESET_PATH="$HOME/.local/share/projectM/presets"
+        TEXTURE_DIR="$HOME/.local/share/projectM/textures"
+    elif [ -d "/opt/homebrew/share/projectM/presets" ]; then
+        PRESET_PATH="/opt/homebrew/share/projectM/presets"
+        TEXTURE_DIR="/opt/homebrew/share/projectM/textures"
+    else
+        PRESET_PATH="/usr/local/share/projectM/presets"
+        TEXTURE_DIR="/usr/local/share/projectM/textures"
+    fi
+else
+    PRESET_PATH="/usr/local/share/projectM/presets"
+    TEXTURE_DIR="/usr/local/share/projectM/textures"
+fi
 TIMELINE_FILE="${TIMELINE_FILE:-}"
 PRESET_DURATION=60
 MESH_X=128
@@ -24,7 +38,16 @@ GST_PID=""
 XVFB_PID=""
 XORG_PID=""
 
+is_macos() {
+    [[ "$OSTYPE" == "darwin"* ]]
+}
+
 has_gpu() {
+    # macOS always has GPU (Metal/VideoToolbox)
+    if is_macos; then
+        return 0
+    fi
+
     if command -v nvidia-smi >/dev/null 2>&1; then
         return 0
     fi
@@ -39,6 +62,11 @@ has_gpu() {
 }
 
 gpu_accessible() {
+    # macOS always has accessible GPU
+    if is_macos; then
+        return 0
+    fi
+
     # First check if nvidia-smi actually works (GPU is functional)
     if command -v nvidia-smi >/dev/null 2>&1; then
         if nvidia-smi >/dev/null 2>&1; then
@@ -604,6 +632,13 @@ select_best_encoder() {
         fi
     fi
 
+    # VideoToolbox (macOS hardware encoding — Apple Silicon / Intel Mac)
+    if is_macos && gst_plugin_available vtenc_h264; then
+        echo "Using vtenc_h264 (Apple VideoToolbox hardware encoding)"
+        ENCODER="vtenc_h264"
+        return
+    fi
+
     # Other hardware encoders (if GPU mode requested)
     if [ "$use_gpu" -eq 1 ]; then
         if gst_plugin_available vaapih264enc; then
@@ -667,7 +702,7 @@ show_help() {
     echo "  -b, --bitrate KBPS     Output video bitrate in kbps (default: $BITRATE)"
     echo "  --speed PRESET         x264 encoding speed preset (default: $SPEED_PRESET, only used with --encoder x264)"
     echo "  --timeline FILE        Path to preset timeline (INI)"
-    echo "  --encoder NAME         Encoder: auto (default), x264, nvh264, vaapih264, qsvh264"
+    echo "  --encoder NAME         Encoder: auto (default), x264, nvh264, vtenc_h264, vaapih264, qsvh264"
     echo "  --force-gpu            Force EGL/DRI headless GPU usage (fail if unavailable)"
     echo "  --force-xvfb           Force legacy software rendering via Xvfb"
     echo "                         Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow"
@@ -782,12 +817,20 @@ if has_gpu && gpu_accessible; then
     echo "GPU detected and accessible - enabling GPU rendering"
 fi
 
-# Select X server based on GPU availability
-if [ "$use_gpu" -eq 1 ]; then
-    # Use X server with dummy driver + EGL for GPU acceleration
+# Select display/GL backend based on platform
+if is_macos; then
+    # macOS: native CGL/Cocoa OpenGL — no X server, no VirtualGL needed
+    export GST_GL_PLATFORM=cgl
+    export GST_GL_WINDOW=cocoa
+    export GST_GL_API=opengl3
+    RENDER_MODE="macOS native (CGL/Cocoa)"
+    echo "macOS detected — using native CGL/Cocoa OpenGL"
+    echo "  VideoToolbox hardware encoding available"
+elif [ "$use_gpu" -eq 1 ]; then
+    # Linux: Use X server with dummy driver + EGL for GPU acceleration
     start_x_with_gpu
 else
-    # Fallback to Xvfb software rendering when no GPU
+    # Linux: Fallback to Xvfb software rendering when no GPU
     start_xvfb_fallback
 fi
 
@@ -832,7 +875,7 @@ echo "Input file: $INPUT_FILE ($(stat -c%s "$INPUT_FILE" 2>/dev/null || stat -f%
 echo "Output directory: $(dirname "$OUTPUT_FILE") (writable: $(test -w "$(dirname "$OUTPUT_FILE")" && echo "yes" || echo "NO"))"
 echo "==================================="
 
-if [ -z "$INSIDE_DOCKER" ]; then
+if [ -z "$INSIDE_DOCKER" ] && ! is_macos; then
     export INSIDE_DOCKER=1
 fi
 
@@ -918,8 +961,8 @@ TEST_PNG="/tmp/projectm_test_$$.png"
 PREFLIGHT_FAILED=0
 
 # Build test pipeline matching actual render pipeline
-if [ "$use_gpu" -eq 1 ]; then
-    # GPU mode: projectm outputs GL textures, need gldownload
+if is_macos || [ "$use_gpu" -eq 1 ]; then
+    # GPU mode (macOS CGL or Linux GPU): projectm outputs GL textures, need gldownload
     echo "  Testing GPU pipeline (with gldownload)..."
     TEST_PIPELINE="audiotestsrc num-buffers=30 ! audioconvert ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! projectm preset=$PRESET_PATH mesh-size=32,24 ! gldownload ! videoconvert ! video/x-raw,width=320,height=240 ! pngenc ! filesink location=$TEST_PNG"
 else
@@ -948,7 +991,8 @@ else
 fi
 
 # If GPU mode test failed, do NOT fall back to Mesa - it produces black frames!
-if [ "$PREFLIGHT_FAILED" -eq 1 ] && [ "$use_gpu" -eq 1 ]; then
+# On macOS, preflight failures are less common but still worth warning about
+if [ "$PREFLIGHT_FAILED" -eq 1 ] && [ "$use_gpu" -eq 1 ] && ! is_macos; then
     echo ""
     echo "❌ GPU preflight test failed!"
     echo ""
@@ -971,7 +1015,7 @@ echo ""
 
 KEY_INT=$((FRAMERATE * 2))
 GL_DOWNLOAD_PIPELINE=""
-if [ "$use_gpu" -eq 1 ] || [ "$FORCE_GL_DOWNLOAD" -eq 1 ]; then
+if is_macos || [ "$use_gpu" -eq 1 ] || [ "$FORCE_GL_DOWNLOAD" -eq 1 ]; then
     # ProjectM outputs GL textures, download to system memory for encoding
     # Skip glcolorconvert with EGL headless as it can't negotiate context
     # Let videoconvert handle any needed format conversion after gldownload
@@ -982,6 +1026,11 @@ case "$ENCODER" in
         # Force I420 (yuv420p) format for QuickTime compatibility
         # Without this, x264 may encode in High 4:4:4 profile with yuv444p which QuickTime can't play
         ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=I420,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! x264enc bitrate=$BITRATE speed-preset=$SPEED_PRESET key-int-max=$KEY_INT threads=0"
+        ;;
+    vtenc_h264)
+        # Apple VideoToolbox hardware encoding (macOS)
+        # vtenc_h264 bitrate is in kbps, allow-frame-reordering=false for lower latency
+        ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! vtenc_h264 bitrate=$BITRATE allow-frame-reordering=false realtime=true"
         ;;
 nvh264)
         ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! nvh264enc bitrate=$BITRATE preset=hp rc-mode=cbr-hq gop-size=$KEY_INT"
@@ -995,7 +1044,7 @@ nvh264)
         ENCODER_PIPELINE="${GL_DOWNLOAD_PIPELINE}videoconvert ! videorate ! video/x-raw,format=NV12,framerate=${FRAMERATE}/1,width=${VIDEO_WIDTH},height=${VIDEO_HEIGHT} ! queue ! msdkh264enc bitrate=$QSV_BITRATE rate-control=cbr gop-size=$KEY_INT"
         ;;
     *)
-        echo "Unsupported encoder '$ENCODER'. Supported encoders: x264, nvh264, vaapih264, qsvh264"
+        echo "Unsupported encoder '$ENCODER'. Supported encoders: x264, nvh264, vtenc_h264, vaapih264, qsvh264"
         exit 1
         ;;
 esac
@@ -1050,7 +1099,7 @@ while kill -0 $GST_PID 2>/dev/null; do
 
     # Check if output file is growing
     if [ -f "$OUTPUT_FILE" ]; then
-        CURRENT_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo "0")
+        CURRENT_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || stat -f%z "$OUTPUT_FILE" 2>/dev/null || echo "0")
         if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ] && [ "$CURRENT_SIZE" -gt 0 ]; then
             STALL_COUNT=$((STALL_COUNT + 5))
             echo "[${WAIT_COUNT}s] Output stalled at ${CURRENT_SIZE} bytes for ${STALL_COUNT}s"
