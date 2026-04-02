@@ -37,8 +37,8 @@ void gl_error_handler(GstGLContext *context, gpointer data) {
     g_error("OpenGL Error: GL_OUT_OF_MEMORY - Memory allocation failed\n");
     break;
   case GL_INVALID_FRAMEBUFFER_OPERATION:
-    g_error("OpenGL Error: GL_INVALID_FRAMEBUFFER_OPERATION - Incomplete "
-            "framebuffer operation\n");
+    g_warning("OpenGL Error: GL_INVALID_FRAMEBUFFER_OPERATION - Incomplete "
+              "framebuffer operation (non-fatal on macOS)\n");
     break;
   case GL_CONTEXT_LOST:
     g_error("OpenGL Error: GL_CONTEXT_LOST - OpenGL context lost\n");
