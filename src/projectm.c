@@ -4,6 +4,7 @@
 
 #include <gst/gst.h>
 
+#include <projectM-4/callbacks.h>
 #include <projectM-4/playlist.h>
 #include <projectM-4/projectM.h>
 
@@ -12,6 +13,15 @@
 
 GST_DEBUG_CATEGORY_STATIC(projectm_debug);
 #define GST_CAT_DEFAULT projectm_debug
+
+static void gst_projectm_preset_switch_failed(const char *preset_filename,
+                                               const char *message,
+                                               void *user_data) {
+  (void)user_data;
+  g_printerr("*** PRESET SWITCH FAILED: %s | Error: %s\n",
+              preset_filename ? preset_filename : "(null)",
+              message ? message : "(no message)");
+}
 
 projectm_handle projectm_init(GstProjectM *plugin) {
   projectm_handle handle = NULL;
@@ -33,6 +43,10 @@ projectm_handle projectm_init(GstProjectM *plugin) {
   } else {
     GST_DEBUG_OBJECT(plugin, "Created projectM instance!");
   }
+
+  // Register preset switch failed callback to get shader compilation errors
+  projectm_set_preset_switch_failed_event_callback(
+      handle, gst_projectm_preset_switch_failed, plugin);
 
   gboolean timeline_active = gst_projectm_timeline_is_active(plugin);
   gboolean use_playlist = plugin->enable_playlist && !timeline_active;
