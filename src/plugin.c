@@ -97,6 +97,16 @@ static void gst_projectm_release_render_target(GstProjectM *plugin,
 static gboolean gst_projectm_download_frame_with_pbo(
     GstProjectM *plugin, const GstGLFuncs *glFunctions, GstVideoFrame *video,
     gsize width, gsize height);
+
+static gboolean gst_projectm_nv12_init(GstProjectM *plugin,
+                                       const GstGLFuncs *glFunctions,
+                                       gsize width, gsize height);
+static void gst_projectm_nv12_release(GstProjectM *plugin,
+                                      const GstGLFuncs *glFunctions);
+static gboolean gst_projectm_nv12_render(GstProjectM *plugin,
+                                         const GstGLFuncs *glFunctions,
+                                         GstVideoFrame *video,
+                                         gsize width, gsize height);
 static void gst_projectm_copy_to_frame(GstVideoFrame *video, const guint8 *src,
                                        gsize width, gsize height);
 
@@ -133,6 +143,27 @@ struct _GstProjectMPrivate {
 
   gboolean headless_mode;
   gboolean headless_checked;
+
+  /* NV12 output state — populated only when negotiated output format is NV12.
+   * Plugin renders projectm into the existing RGBA FBO, then runs two shader
+   * passes (Y full-res, UV half-res) into helper FBOs whose color attachments
+   * are R8 / RG8 textures. ReadPixels on each plane writes directly into the
+   * GstVideoFrame's NV12 plane data — no CPU-side ABGR→NV12 conversion. */
+  gboolean nv12_mode;
+  gboolean nv12_initialized;
+  GLuint   nv12_y_fbo;
+  GLuint   nv12_y_tex;
+  GLuint   nv12_uv_fbo;
+  GLuint   nv12_uv_tex;
+  GLuint   nv12_program;
+  GLuint   nv12_vao;     /* required by GL 3.2 core profile (macOS) */
+  GLuint   nv12_vbo;
+  GLint    nv12_uniform_tex;
+  GLint    nv12_uniform_pass;
+  GLint    nv12_attrib_pos;
+  GLint    nv12_attrib_uv;
+  gsize    nv12_width;   /* full-res Y plane size — tracked to detect resize */
+  gsize    nv12_height;
 };
 
 G_DEFINE_TYPE_WITH_CODE(GstProjectM, gst_projectm,
@@ -921,6 +952,371 @@ static gboolean gst_projectm_download_frame_with_pbo(
 
   return copied;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * NV12 output path
+ *
+ * When the negotiated downstream format is NV12, the plugin runs two
+ * GLSL fragment-shader passes against the projectm RGBA FBO instead of
+ * doing CPU-side colour conversion downstream:
+ *
+ *   1. Y pass  — full-resolution: writes BT.601 luma into a R8 texture
+ *   2. UV pass — half-resolution: writes interleaved U/V into a RG8
+ *                texture (linear-filtered sampling averages 2x2 RGB
+ *                blocks, giving 4:2:0 chroma subsampling for free)
+ *
+ * ReadPixels then pulls each plane directly into the GstVideoFrame's
+ * NV12 plane data. This eliminates the downstream "videoconvert
+ * ABGR→NV12" CPU step which dominated render time on Apple Silicon.
+ *
+ * Shader uses `#version 150` core profile syntax (works on macOS GL3.2
+ * core context, which is what Tauri/Cocoa exposes). If we ever target
+ * GLES2 we'll need a second source string.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static const char *NV12_VERTEX_SHADER =
+    "#version 150 core\n"
+    "in vec2 a_pos;\n"
+    "in vec2 a_uv;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+    "  v_uv = a_uv;\n"
+    "}\n";
+
+static const char *NV12_FRAGMENT_SHADER =
+    "#version 150 core\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform int u_pass;\n"  /* 0=Y, 1=UV */
+    "in  vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "  vec4 c = texture(u_tex, v_uv);\n"
+    /* BT.601 limited-range coefficients matching what vtenc_h264 expects */
+    "  if (u_pass == 0) {\n"
+    "    float y = 0.257*c.r + 0.504*c.g + 0.098*c.b + 16.0/255.0;\n"
+    "    fragColor = vec4(y, 0.0, 0.0, 1.0);\n"
+    "  } else {\n"
+    "    float u = -0.148*c.r - 0.291*c.g + 0.439*c.b + 128.0/255.0;\n"
+    "    float v =  0.439*c.r - 0.368*c.g - 0.071*c.b + 128.0/255.0;\n"
+    "    fragColor = vec4(u, v, 0.0, 1.0);\n"
+    "  }\n"
+    "}\n";
+
+/* Fullscreen quad geometry: 4 verts, interleaved (pos.xy, uv.xy).
+ * Two triangles via GL_TRIANGLE_STRIP. */
+static const GLfloat NV12_QUAD_VERTS[] = {
+    /* x,    y,    u,   v   */
+    -1.0f, -1.0f, 0.0f, 0.0f,
+     1.0f, -1.0f, 1.0f, 0.0f,
+    -1.0f,  1.0f, 0.0f, 1.0f,
+     1.0f,  1.0f, 1.0f, 1.0f,
+};
+
+static GLuint gst_projectm_nv12_compile_shader(GstProjectM *plugin,
+                                               const GstGLFuncs *glFunctions,
+                                               GLenum type,
+                                               const char *source) {
+  GLuint shader = glFunctions->CreateShader(type);
+  if (shader == 0) {
+    GST_ERROR_OBJECT(plugin, "NV12: CreateShader returned 0");
+    return 0;
+  }
+  glFunctions->ShaderSource(shader, 1, &source, NULL);
+  glFunctions->CompileShader(shader);
+
+  GLint status = GL_FALSE;
+  glFunctions->GetShaderiv(shader, GL_COMPILE_STATUS, &status);
+  if (status == GL_FALSE) {
+    char log[1024];
+    GLsizei len = 0;
+    if (glFunctions->GetShaderInfoLog) {
+      glFunctions->GetShaderInfoLog(shader, sizeof(log) - 1, &len, log);
+      log[len] = '\0';
+    } else {
+      log[0] = '\0';
+    }
+    GST_ERROR_OBJECT(plugin, "NV12: shader compile failed: %s", log);
+    glFunctions->DeleteShader(shader);
+    return 0;
+  }
+  return shader;
+}
+
+static gboolean gst_projectm_nv12_init(GstProjectM *plugin,
+                                       const GstGLFuncs *glFunctions,
+                                       gsize width, gsize height) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  /* If already initialized at the right size, nothing to do */
+  if (priv->nv12_initialized &&
+      priv->nv12_width == width &&
+      priv->nv12_height == height) {
+    return TRUE;
+  }
+
+  /* Resize: tear down and rebuild textures/FBOs but keep shader program */
+  if (priv->nv12_initialized) {
+    if (priv->nv12_y_fbo) glFunctions->DeleteFramebuffers(1, &priv->nv12_y_fbo);
+    if (priv->nv12_uv_fbo) glFunctions->DeleteFramebuffers(1, &priv->nv12_uv_fbo);
+    if (priv->nv12_y_tex) glFunctions->DeleteTextures(1, &priv->nv12_y_tex);
+    if (priv->nv12_uv_tex) glFunctions->DeleteTextures(1, &priv->nv12_uv_tex);
+    priv->nv12_y_fbo = priv->nv12_uv_fbo = 0;
+    priv->nv12_y_tex = priv->nv12_uv_tex = 0;
+  }
+
+  /* Compile shader program once. Persists across resizes. */
+  if (priv->nv12_program == 0) {
+    GLuint vs = gst_projectm_nv12_compile_shader(plugin, glFunctions,
+                                                  GL_VERTEX_SHADER,
+                                                  NV12_VERTEX_SHADER);
+    GLuint fs = gst_projectm_nv12_compile_shader(plugin, glFunctions,
+                                                  GL_FRAGMENT_SHADER,
+                                                  NV12_FRAGMENT_SHADER);
+    if (vs == 0 || fs == 0) {
+      if (vs) glFunctions->DeleteShader(vs);
+      if (fs) glFunctions->DeleteShader(fs);
+      return FALSE;
+    }
+
+    GLuint prog = glFunctions->CreateProgram();
+    glFunctions->AttachShader(prog, vs);
+    glFunctions->AttachShader(prog, fs);
+    glFunctions->LinkProgram(prog);
+
+    GLint linked = GL_FALSE;
+    glFunctions->GetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (linked == GL_FALSE) {
+      char log[1024];
+      GLsizei len = 0;
+      if (glFunctions->GetProgramInfoLog) {
+        glFunctions->GetProgramInfoLog(prog, sizeof(log) - 1, &len, log);
+        log[len] = '\0';
+      } else {
+        log[0] = '\0';
+      }
+      GST_ERROR_OBJECT(plugin, "NV12: program link failed: %s", log);
+      glFunctions->DeleteShader(vs);
+      glFunctions->DeleteShader(fs);
+      glFunctions->DeleteProgram(prog);
+      return FALSE;
+    }
+    glFunctions->DeleteShader(vs);
+    glFunctions->DeleteShader(fs);
+
+    priv->nv12_program       = prog;
+    priv->nv12_uniform_tex   = glFunctions->GetUniformLocation(prog, "u_tex");
+    priv->nv12_uniform_pass  = glFunctions->GetUniformLocation(prog, "u_pass");
+    priv->nv12_attrib_pos    = glFunctions->GetAttribLocation(prog, "a_pos");
+    priv->nv12_attrib_uv     = glFunctions->GetAttribLocation(prog, "a_uv");
+  }
+
+  /* Quad VBO + VAO — also persist. GL 3.2 core profile mandates a bound
+   * VAO before any vertex attribute call; without it every draw fails
+   * with GL_INVALID_OPERATION. We bake the attribute pointer setup into
+   * the VAO once so each frame's draw pass is just bind+draw. */
+  if (priv->nv12_vbo == 0) {
+    glFunctions->GenBuffers(1, &priv->nv12_vbo);
+    glFunctions->BindBuffer(GL_ARRAY_BUFFER, priv->nv12_vbo);
+    glFunctions->BufferData(GL_ARRAY_BUFFER, sizeof(NV12_QUAD_VERTS),
+                            NV12_QUAD_VERTS, GL_STATIC_DRAW);
+    glFunctions->BindBuffer(GL_ARRAY_BUFFER, 0);
+  }
+  if (priv->nv12_vao == 0 && glFunctions->GenVertexArrays) {
+    glFunctions->GenVertexArrays(1, &priv->nv12_vao);
+    glFunctions->BindVertexArray(priv->nv12_vao);
+    glFunctions->BindBuffer(GL_ARRAY_BUFFER, priv->nv12_vbo);
+    if (priv->nv12_attrib_pos >= 0) {
+      glFunctions->EnableVertexAttribArray((GLuint)priv->nv12_attrib_pos);
+      glFunctions->VertexAttribPointer((GLuint)priv->nv12_attrib_pos, 2,
+                                       GL_FLOAT, GL_FALSE,
+                                       4 * sizeof(GLfloat), (void *)0);
+    }
+    if (priv->nv12_attrib_uv >= 0) {
+      glFunctions->EnableVertexAttribArray((GLuint)priv->nv12_attrib_uv);
+      glFunctions->VertexAttribPointer((GLuint)priv->nv12_attrib_uv, 2,
+                                       GL_FLOAT, GL_FALSE,
+                                       4 * sizeof(GLfloat),
+                                       (void *)(2 * sizeof(GLfloat)));
+    }
+    glFunctions->BindVertexArray(0);
+    glFunctions->BindBuffer(GL_ARRAY_BUFFER, 0);
+  }
+
+  /* Y plane FBO: full WxH, single channel R8 */
+  glFunctions->GenTextures(1, &priv->nv12_y_tex);
+  glFunctions->BindTexture(GL_TEXTURE_2D, priv->nv12_y_tex);
+  glFunctions->TexImage2D(GL_TEXTURE_2D, 0, GL_R8,
+                          (GLsizei)width, (GLsizei)height,
+                          0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  glFunctions->GenFramebuffers(1, &priv->nv12_y_fbo);
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->nv12_y_fbo);
+  glFunctions->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, priv->nv12_y_tex, 0);
+  if (glFunctions->CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    GST_ERROR_OBJECT(plugin, "NV12: Y FBO incomplete");
+    return FALSE;
+  }
+
+  /* UV plane FBO: half W/2 x H/2, two channels RG8.
+   * Linear filtering on the source texture during this pass gives 4:2:0
+   * chroma subsampling automatically (each output texel averages 2x2 RGB). */
+  glFunctions->GenTextures(1, &priv->nv12_uv_tex);
+  glFunctions->BindTexture(GL_TEXTURE_2D, priv->nv12_uv_tex);
+  glFunctions->TexImage2D(GL_TEXTURE_2D, 0, GL_RG8,
+                          (GLsizei)(width / 2), (GLsizei)(height / 2),
+                          0, GL_RG, GL_UNSIGNED_BYTE, NULL);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  glFunctions->GenFramebuffers(1, &priv->nv12_uv_fbo);
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->nv12_uv_fbo);
+  glFunctions->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, priv->nv12_uv_tex, 0);
+  if (glFunctions->CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    GST_ERROR_OBJECT(plugin, "NV12: UV FBO incomplete");
+    return FALSE;
+  }
+
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  glFunctions->BindTexture(GL_TEXTURE_2D, 0);
+
+  priv->nv12_width = width;
+  priv->nv12_height = height;
+  priv->nv12_initialized = TRUE;
+
+  GST_INFO_OBJECT(plugin, "NV12 output initialized at %zux%zu (Y=R8, UV=RG8 half-res)",
+                  width, height);
+  return TRUE;
+}
+
+static void gst_projectm_nv12_release(GstProjectM *plugin,
+                                      const GstGLFuncs *glFunctions) {
+  GstProjectMPrivate *priv = plugin->priv;
+  if (!priv->nv12_initialized && priv->nv12_program == 0) return;
+
+  if (glFunctions) {
+    if (priv->nv12_y_fbo)  glFunctions->DeleteFramebuffers(1, &priv->nv12_y_fbo);
+    if (priv->nv12_uv_fbo) glFunctions->DeleteFramebuffers(1, &priv->nv12_uv_fbo);
+    if (priv->nv12_y_tex)  glFunctions->DeleteTextures(1, &priv->nv12_y_tex);
+    if (priv->nv12_uv_tex) glFunctions->DeleteTextures(1, &priv->nv12_uv_tex);
+    if (priv->nv12_vbo)    glFunctions->DeleteBuffers(1, &priv->nv12_vbo);
+    if (priv->nv12_vao && glFunctions->DeleteVertexArrays)
+      glFunctions->DeleteVertexArrays(1, &priv->nv12_vao);
+    if (priv->nv12_program) glFunctions->DeleteProgram(priv->nv12_program);
+  }
+
+  priv->nv12_y_fbo = priv->nv12_uv_fbo = 0;
+  priv->nv12_y_tex = priv->nv12_uv_tex = 0;
+  priv->nv12_vbo = 0;
+  priv->nv12_vao = 0;
+  priv->nv12_program = 0;
+  priv->nv12_initialized = FALSE;
+  priv->nv12_width = priv->nv12_height = 0;
+}
+
+/* Run a single full-screen quad pass with the NV12 program.
+ * Caller must have bound the destination FBO + set viewport before calling.
+ * VAO carries the vertex attribute setup so we just bind + draw. */
+static void gst_projectm_nv12_draw_pass(GstProjectM *plugin,
+                                        const GstGLFuncs *glFunctions,
+                                        int pass) {
+  GstProjectMPrivate *priv = plugin->priv;
+
+  glFunctions->UseProgram(priv->nv12_program);
+  glFunctions->Uniform1i(priv->nv12_uniform_tex, 0);     /* texture unit 0 */
+  glFunctions->Uniform1i(priv->nv12_uniform_pass, pass);
+
+  glFunctions->ActiveTexture(GL_TEXTURE0);
+  glFunctions->BindTexture(GL_TEXTURE_2D, priv->fbo_texture_id);
+  /* UV pass uses linear filtering for 2x2 averaging (4:2:0 subsampling).
+   * Y pass uses nearest — no scaling, exact pixel values. */
+  GLint filter = (pass == 1) ? GL_LINEAR : GL_NEAREST;
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+
+  if (priv->nv12_vao && glFunctions->BindVertexArray) {
+    glFunctions->BindVertexArray(priv->nv12_vao);
+  }
+  glFunctions->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  if (priv->nv12_vao && glFunctions->BindVertexArray) {
+    glFunctions->BindVertexArray(0);
+  }
+
+  glFunctions->BindTexture(GL_TEXTURE_2D, 0);
+  glFunctions->UseProgram(0);
+}
+
+static gboolean gst_projectm_nv12_render(GstProjectM *plugin,
+                                         const GstGLFuncs *glFunctions,
+                                         GstVideoFrame *video,
+                                         gsize width, gsize height) {
+  if (!gst_projectm_nv12_init(plugin, glFunctions, width, height)) {
+    return FALSE;
+  }
+  GstProjectMPrivate *priv = plugin->priv;
+
+  /* Save current viewport and disable depth/blend that projectm may have left on */
+  GLint prev_viewport[4] = {0, 0, 0, 0};
+  if (glFunctions->GetIntegerv) glFunctions->GetIntegerv(GL_VIEWPORT, prev_viewport);
+  if (glFunctions->Disable) {
+    glFunctions->Disable(GL_DEPTH_TEST);
+    glFunctions->Disable(GL_BLEND);
+    glFunctions->Disable(GL_CULL_FACE);
+  }
+
+  /* Y pass: full-resolution into nv12_y_fbo */
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->nv12_y_fbo);
+  glFunctions->Viewport(0, 0, (GLsizei)width, (GLsizei)height);
+  gst_projectm_nv12_draw_pass(plugin, glFunctions, 0);
+
+  /* ReadPixels Y plane directly into the GstVideoFrame's plane 0.
+   * NV12 plane 0 stride may be > width (alignment padding) — we use
+   * GL_PACK_ROW_LENGTH so the GL writes match GStreamer's stride. */
+  GLint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE(video, 0);
+  if (glFunctions->PixelStorei) {
+    glFunctions->PixelStorei(GL_PACK_ALIGNMENT, 1);
+    glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, y_stride);
+  }
+  glFunctions->ReadPixels(0, 0, (GLsizei)width, (GLsizei)height,
+                          GL_RED, GL_UNSIGNED_BYTE,
+                          (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 0));
+
+  /* UV pass: half-resolution into nv12_uv_fbo */
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->nv12_uv_fbo);
+  glFunctions->Viewport(0, 0, (GLsizei)(width / 2), (GLsizei)(height / 2));
+  gst_projectm_nv12_draw_pass(plugin, glFunctions, 1);
+
+  /* ReadPixels UV plane (interleaved RG = U,V,U,V…) into plane 1 */
+  GLint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE(video, 1);
+  if (glFunctions->PixelStorei) {
+    /* UV stride is in bytes; each texel is 2 bytes (U+V), so row length
+     * in pixels = stride/2 */
+    glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, uv_stride / 2);
+  }
+  glFunctions->ReadPixels(0, 0, (GLsizei)(width / 2), (GLsizei)(height / 2),
+                          GL_RG, GL_UNSIGNED_BYTE,
+                          (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 1));
+
+  /* Reset state */
+  if (glFunctions->PixelStorei) {
+    glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, 0);
+  }
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  if (glFunctions->Viewport) {
+    glFunctions->Viewport(prev_viewport[0], prev_viewport[1],
+                          prev_viewport[2], prev_viewport[3]);
+  }
+  return TRUE;
+}
+
 gboolean gst_projectm_timeline_is_active(GstProjectM *plugin) {
   if (plugin == NULL) {
     return FALSE;
@@ -1220,6 +1616,7 @@ static void gst_projectm_gl_stop(GstGLBaseAudioVisualizer *src) {
 
   gst_projectm_release_pbos(plugin, glFunctions);
   gst_projectm_release_render_target(plugin, glFunctions);
+  gst_projectm_nv12_release(plugin, glFunctions);
   plugin->priv->current_timeline_index = -1;
   plugin->priv->timeline_initialized = FALSE;
   plugin->priv->first_frame_received = FALSE;
@@ -1307,11 +1704,26 @@ static gboolean gst_projectm_setup(GstGLBaseAudioVisualizer *glav) {
   switch (video_format) {
   case GST_VIDEO_FORMAT_ABGR:
     plugin->priv->gl_format = GL_RGBA;
+    plugin->priv->nv12_mode = FALSE;
     break;
 
   case GST_VIDEO_FORMAT_RGBA:
     // GL_ABGR_EXT does not seem to be well-supported, does not work on Windows
     plugin->priv->gl_format = GL_ABGR_EXT;
+    plugin->priv->nv12_mode = FALSE;
+    break;
+
+  case GST_VIDEO_FORMAT_NV12:
+    /* NV12 takes a different render path: projectm renders to its existing
+     * RGBA FBO, then two GLSL passes convert to Y (full res, R8) and UV
+     * (half res, RG8) plane textures. ReadPixels each plane into the
+     * GstVideoFrame. We still keep gl_format = GL_RGBA for the source FBO
+     * since projectm itself only outputs RGBA. */
+    plugin->priv->gl_format = GL_RGBA;
+    plugin->priv->nv12_mode = TRUE;
+    GST_INFO_OBJECT(plugin,
+                    "Output format = NV12: enabling GPU shader-based "
+                    "RGBA→NV12 conversion path");
     break;
 
   default:
@@ -1473,22 +1885,34 @@ static gboolean gst_projectm_render(GstGLBaseAudioVisualizer *glav,
   }
   gl_error_handler(glav->context, plugin);
 
-  /* Ensure FBO is still bound for ReadPixels */
-  if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
-    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, plugin->priv->fbo_id);
-  }
+  /* NV12 path: shader-convert RGBA FBO into Y + UV planes, ReadPixels each.
+   * Skips PBO async readback — perf gain comes from eliminating downstream
+   * videoconvert, not from PBO double-buffering of the readback itself. */
+  if (plugin->priv->nv12_mode) {
+    if (!gst_projectm_nv12_render(plugin, glFunctions, video,
+                                   windowWidth, windowHeight)) {
+      GST_ERROR_OBJECT(plugin, "NV12 render path failed");
+      gst_buffer_unmap(audio, &audioMap);
+      return FALSE;
+    }
+  } else {
+    /* Ensure FBO is still bound for ReadPixels */
+    if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
+      glFunctions->BindFramebuffer(GL_FRAMEBUFFER, plugin->priv->fbo_id);
+    }
 
-  gboolean used_async = FALSE;
-  if (gst_projectm_ensure_pbos(plugin, glFunctions, windowWidth,
-                               windowHeight)) {
-    used_async = gst_projectm_download_frame_with_pbo(
-        plugin, glFunctions, video, windowWidth, windowHeight);
-  }
+    gboolean used_async = FALSE;
+    if (gst_projectm_ensure_pbos(plugin, glFunctions, windowWidth,
+                                 windowHeight)) {
+      used_async = gst_projectm_download_frame_with_pbo(
+          plugin, glFunctions, video, windowWidth, windowHeight);
+    }
 
-  if (!used_async) {
-    glFunctions->ReadPixels(0, 0, windowWidth, windowHeight,
-                            plugin->priv->gl_format, GL_UNSIGNED_INT_8_8_8_8,
-                            (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 0));
+    if (!used_async) {
+      glFunctions->ReadPixels(0, 0, windowWidth, windowHeight,
+                              plugin->priv->gl_format, GL_UNSIGNED_INT_8_8_8_8,
+                              (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 0));
+    }
   }
 
   if (using_fbo && glFunctions && glFunctions->BindFramebuffer) {
