@@ -39,7 +39,20 @@ const gchar *get_video_src_cap(unsigned int type) {
 
   switch (type) {
   case 0:
-    format = GST_VIDEO_CAPS_MAKE("video/x-raw, format = (string) { ABGR }, "
+    /* Output formats:
+     *   - ABGR: legacy CPU readback path (renders RGBA to FBO, ReadPixels to
+     *     CPU, downstream videoconvert handles further conversion). Slow on
+     *     macOS because videoconvert ABGR→NV12 dominates render time.
+     *   - NV12: GPU-converted output. Plugin runs RGBA→NV12 shader passes
+     *     against the FBO and ReadPixels each plane. Eliminates downstream
+     *     videoconvert entirely on the path projectm → vtenc_h264.
+     *
+     * Caps negotiation will pick whichever the downstream prefers; vtenc_h264
+     * advertises NV12 in its sink caps so it gets chosen automatically when
+     * vtenc is downstream. ABGR remains the fallback for any consumer that
+     * doesn't accept NV12.
+     */
+    format = GST_VIDEO_CAPS_MAKE("video/x-raw, format = (string) { ABGR, NV12 }, "
                                  "framerate=(fraction)[0/1,MAX]");
     break;
   default:
