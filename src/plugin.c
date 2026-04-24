@@ -1208,14 +1208,11 @@ static gboolean gst_projectm_nv12_init(GstProjectM *plugin,
     return FALSE;
   }
 
-  /* Restore projectm's render-target binding. Mirrors the ABGR path's
-   * "never unbind to framebuffer 0 in headless mode" rule — fbo 0 doesn't
-   * exist under headless EGL. */
-  if (priv->fbo_id != 0) {
-    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->fbo_id);
-  } else {
-    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
-  }
+  /* Restore projectm's render-target binding. nv12_render is only called
+   * after gst_projectm_ensure_render_target succeeded, which guarantees
+   * priv->fbo_id is non-zero — so we don't need a fallback to framebuffer
+   * 0 (which doesn't exist under headless EGL). */
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->fbo_id);
   glFunctions->BindTexture(GL_TEXTURE_2D, 0);
 
   priv->nv12_width = width;
@@ -1352,13 +1349,10 @@ static gboolean gst_projectm_nv12_render(GstProjectM *plugin,
   }
   /* Restore projectm's render-target binding, not framebuffer 0. Under
    * headless EGL (production GPU pods) framebuffer 0 doesn't exist and
-   * binding it raises GL_INVALID_OPERATION on the next draw — same rule
-   * the ABGR path already follows in its FBO guard. */
-  if (priv->fbo_id != 0) {
-    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->fbo_id);
-  } else {
-    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
-  }
+   * binding it raises GL_INVALID_OPERATION on the next draw. nv12_render
+   * is only called after gst_projectm_ensure_render_target succeeded, so
+   * priv->fbo_id is guaranteed non-zero — no fallback needed. */
+  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->fbo_id);
   if (glFunctions->Viewport) {
     glFunctions->Viewport(prev_viewport[0], prev_viewport[1],
                           prev_viewport[2], prev_viewport[3]);
