@@ -984,6 +984,13 @@ static const char *NV12_VERTEX_SHADER =
     "  v_uv = a_uv;\n"
     "}\n";
 
+/* BT.601 STUDIO-SWING (limited-range) coefficients:
+ *   Y  in [16, 235]
+ *   UV in [16, 240]
+ * vtenc_h264 expects studio-swing input by default, matching the
+ * `color_range=tv` we observe in ffprobe output. Do NOT swap to
+ * full-range (`pc`) coefficients without also signalling it on the
+ * encoder, otherwise downstream players will misinterpret luma. */
 static const char *NV12_FRAGMENT_SHADER =
     "#version 150 core\n"
     "uniform sampler2D u_tex;\n"
@@ -992,7 +999,6 @@ static const char *NV12_FRAGMENT_SHADER =
     "out vec4 fragColor;\n"
     "void main() {\n"
     "  vec4 c = texture(u_tex, v_uv);\n"
-    /* BT.601 limited-range coefficients matching what vtenc_h264 expects */
     "  if (u_pass == 0) {\n"
     "    float y = 0.257*c.r + 0.504*c.g + 0.098*c.b + 16.0/255.0;\n"
     "    fragColor = vec4(y, 0.0, 0.0, 1.0);\n"
@@ -1143,7 +1149,10 @@ static gboolean gst_projectm_nv12_init(GstProjectM *plugin,
     glFunctions->BindBuffer(GL_ARRAY_BUFFER, 0);
   }
 
-  /* Y plane FBO: full WxH, single channel R8 */
+  /* Y plane FBO: full WxH, single channel R8.
+   * Note: filter set to GL_LINEAR so the source→Y shader pass can bilinear-
+   * sample the RGBA source. (Y uses full-res so no scaling; LINEAR is just
+   * a safer default in case of non-integer viewport ratios later.) */
   glFunctions->GenTextures(1, &priv->nv12_y_tex);
   glFunctions->BindTexture(GL_TEXTURE_2D, priv->nv12_y_tex);
   glFunctions->TexImage2D(GL_TEXTURE_2D, 0, GL_R8,
@@ -1159,13 +1168,21 @@ static gboolean gst_projectm_nv12_init(GstProjectM *plugin,
   glFunctions->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                     GL_TEXTURE_2D, priv->nv12_y_tex, 0);
   if (glFunctions->CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-    GST_ERROR_OBJECT(plugin, "NV12: Y FBO incomplete");
+    GST_ERROR_OBJECT(plugin, "NV12: Y FBO incomplete (likely R8 unsupported)");
+    /* Clean up partial allocations before returning so a later re-init
+     * (e.g. at a different resolution) doesn't leak texture/FBO objects. */
+    glFunctions->DeleteFramebuffers(1, &priv->nv12_y_fbo);
+    glFunctions->DeleteTextures(1, &priv->nv12_y_tex);
+    priv->nv12_y_fbo = 0;
+    priv->nv12_y_tex = 0;
     return FALSE;
   }
 
   /* UV plane FBO: half W/2 x H/2, two channels RG8.
-   * Linear filtering on the source texture during this pass gives 4:2:0
-   * chroma subsampling automatically (each output texel averages 2x2 RGB). */
+   * Filter set to GL_LINEAR so the viewport-scaled quad draw (rendering
+   * source WxH into a W/2 x H/2 destination) automatically averages 2x2
+   * source blocks via hardware bilinear — this is the 4:2:0 chroma
+   * subsampling. No per-frame TexParameteri needed on the source texture. */
   glFunctions->GenTextures(1, &priv->nv12_uv_tex);
   glFunctions->BindTexture(GL_TEXTURE_2D, priv->nv12_uv_tex);
   glFunctions->TexImage2D(GL_TEXTURE_2D, 0, GL_RG8,
@@ -1181,11 +1198,24 @@ static gboolean gst_projectm_nv12_init(GstProjectM *plugin,
   glFunctions->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                     GL_TEXTURE_2D, priv->nv12_uv_tex, 0);
   if (glFunctions->CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-    GST_ERROR_OBJECT(plugin, "NV12: UV FBO incomplete");
+    GST_ERROR_OBJECT(plugin, "NV12: UV FBO incomplete (likely RG8 unsupported)");
+    glFunctions->DeleteFramebuffers(1, &priv->nv12_y_fbo);
+    glFunctions->DeleteFramebuffers(1, &priv->nv12_uv_fbo);
+    glFunctions->DeleteTextures(1, &priv->nv12_y_tex);
+    glFunctions->DeleteTextures(1, &priv->nv12_uv_tex);
+    priv->nv12_y_fbo = priv->nv12_uv_fbo = 0;
+    priv->nv12_y_tex = priv->nv12_uv_tex = 0;
     return FALSE;
   }
 
-  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  /* Restore projectm's render-target binding. Mirrors the ABGR path's
+   * "never unbind to framebuffer 0 in headless mode" rule — fbo 0 doesn't
+   * exist under headless EGL. */
+  if (priv->fbo_id != 0) {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->fbo_id);
+  } else {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  }
   glFunctions->BindTexture(GL_TEXTURE_2D, 0);
 
   priv->nv12_width = width;
@@ -1200,7 +1230,10 @@ static gboolean gst_projectm_nv12_init(GstProjectM *plugin,
 static void gst_projectm_nv12_release(GstProjectM *plugin,
                                       const GstGLFuncs *glFunctions) {
   GstProjectMPrivate *priv = plugin->priv;
-  if (!priv->nv12_initialized && priv->nv12_program == 0) return;
+  /* Skip the early-exit guard. We touched too many independent resources
+   * (program, VBO, VAO, two FBOs, two textures) for any single flag to be
+   * a reliable signal — if init failed midway through, only some are
+   * non-zero. The per-resource null checks below handle every case. */
 
   if (glFunctions) {
     if (priv->nv12_y_fbo)  glFunctions->DeleteFramebuffers(1, &priv->nv12_y_fbo);
@@ -1224,7 +1257,14 @@ static void gst_projectm_nv12_release(GstProjectM *plugin,
 
 /* Run a single full-screen quad pass with the NV12 program.
  * Caller must have bound the destination FBO + set viewport before calling.
- * VAO carries the vertex attribute setup so we just bind + draw. */
+ * VAO carries the vertex attribute setup so we just bind + draw.
+ *
+ * Note: we deliberately do NOT mutate the source texture's filter mode
+ * here. The 4:2:0 chroma subsampling for the UV pass comes from rendering
+ * the source-sized quad into a half-sized viewport — bilinear sampling on
+ * the source texture (set once during FBO creation) averages 2x2 RGB
+ * blocks naturally during rasterisation. Mutating the source filter
+ * per-frame would also affect the ABGR PBO readback path. */
 static void gst_projectm_nv12_draw_pass(GstProjectM *plugin,
                                         const GstGLFuncs *glFunctions,
                                         int pass) {
@@ -1236,11 +1276,6 @@ static void gst_projectm_nv12_draw_pass(GstProjectM *plugin,
 
   glFunctions->ActiveTexture(GL_TEXTURE0);
   glFunctions->BindTexture(GL_TEXTURE_2D, priv->fbo_texture_id);
-  /* UV pass uses linear filtering for 2x2 averaging (4:2:0 subsampling).
-   * Y pass uses nearest — no scaling, exact pixel values. */
-  GLint filter = (pass == 1) ? GL_LINEAR : GL_NEAREST;
-  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-  glFunctions->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
 
   if (priv->nv12_vao && glFunctions->BindVertexArray) {
     glFunctions->BindVertexArray(priv->nv12_vao);
@@ -1279,11 +1314,15 @@ static gboolean gst_projectm_nv12_render(GstProjectM *plugin,
 
   /* ReadPixels Y plane directly into the GstVideoFrame's plane 0.
    * NV12 plane 0 stride may be > width (alignment padding) — we use
-   * GL_PACK_ROW_LENGTH so the GL writes match GStreamer's stride. */
-  GLint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE(video, 0);
+   * GL_PACK_ROW_LENGTH so the GL writes match GStreamer's stride.
+   * GL_PACK_ROW_LENGTH is in PIXELS (not bytes). For R8 the values are
+   * identical, but we compute explicitly so the unit is obvious.
+   * GL_PACK_ALIGNMENT=1 avoids GL padding rows to 4-byte boundaries. */
+  GLint y_stride_bytes = GST_VIDEO_FRAME_PLANE_STRIDE(video, 0);
+  GLint y_stride_pixels = y_stride_bytes;        /* R8: 1 byte/pixel */
   if (glFunctions->PixelStorei) {
     glFunctions->PixelStorei(GL_PACK_ALIGNMENT, 1);
-    glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, y_stride);
+    glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, y_stride_pixels);
   }
   glFunctions->ReadPixels(0, 0, (GLsizei)width, (GLsizei)height,
                           GL_RED, GL_UNSIGNED_BYTE,
@@ -1294,22 +1333,32 @@ static gboolean gst_projectm_nv12_render(GstProjectM *plugin,
   glFunctions->Viewport(0, 0, (GLsizei)(width / 2), (GLsizei)(height / 2));
   gst_projectm_nv12_draw_pass(plugin, glFunctions, 1);
 
-  /* ReadPixels UV plane (interleaved RG = U,V,U,V…) into plane 1 */
-  GLint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE(video, 1);
+  /* ReadPixels UV plane (interleaved RG = U,V,U,V…) into plane 1.
+   * GL_PACK_ROW_LENGTH is in PIXELS; each UV texel is RG (2 bytes) so
+   * pixels = stride_bytes / 2. */
+  GLint uv_stride_bytes = GST_VIDEO_FRAME_PLANE_STRIDE(video, 1);
+  GLint uv_stride_pixels = uv_stride_bytes / 2;  /* RG8: 2 bytes/pixel */
   if (glFunctions->PixelStorei) {
-    /* UV stride is in bytes; each texel is 2 bytes (U+V), so row length
-     * in pixels = stride/2 */
-    glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, uv_stride / 2);
+    glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, uv_stride_pixels);
   }
   glFunctions->ReadPixels(0, 0, (GLsizei)(width / 2), (GLsizei)(height / 2),
                           GL_RG, GL_UNSIGNED_BYTE,
                           (guint8 *)GST_VIDEO_FRAME_PLANE_DATA(video, 1));
 
-  /* Reset state */
+  /* Reset pack state so other code in this GL context gets defaults back */
   if (glFunctions->PixelStorei) {
     glFunctions->PixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glFunctions->PixelStorei(GL_PACK_ALIGNMENT, 4);  /* GL default */
   }
-  glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  /* Restore projectm's render-target binding, not framebuffer 0. Under
+   * headless EGL (production GPU pods) framebuffer 0 doesn't exist and
+   * binding it raises GL_INVALID_OPERATION on the next draw — same rule
+   * the ABGR path already follows in its FBO guard. */
+  if (priv->fbo_id != 0) {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, priv->fbo_id);
+  } else {
+    glFunctions->BindFramebuffer(GL_FRAMEBUFFER, 0);
+  }
   if (glFunctions->Viewport) {
     glFunctions->Viewport(prev_viewport[0], prev_viewport[1],
                           prev_viewport[2], prev_viewport[3]);
