@@ -1579,8 +1579,14 @@ void gst_projectm_get_property(GObject *object, guint property_id,
  * x264enc tolerates that, but hardware encoders (nvh264enc, nvd3d11h264enc,
  * mfh264enc) pass it through, h264parse then drops the PTS on the second
  * frame, and mp4mux fails the whole render with "Buffer has no PTS".
- * Moving a non-increasing PTS one frame duration past the previous one fixes
- * every encoder and changes nothing for buffers that were already in order.
+ *
+ * A buffer whose PTS is not past the previous one is dropped. Moving it one
+ * frame later instead (the first version of this fix) collides with the next
+ * frame, so the shift cascades, and adding a 33333333 ns duration three times
+ * lands 1 ns before the next real frame. mp4mux rounds both to the same tick,
+ * so the file still carried a duplicate PTS, at frame 4 instead of frame 1.
+ * Dropping leaves every other frame at its own time, keeps audio sync, and
+ * changes nothing for buffers that were already in order.
  */
 static GstPadProbeReturn gst_projectm_src_probe(GstPad *pad,
                                                 GstPadProbeInfo *info,
@@ -1605,17 +1611,11 @@ static GstPadProbeReturn gst_projectm_src_probe(GstPad *pad,
 
   if (GST_CLOCK_TIME_IS_VALID(pts) && GST_CLOCK_TIME_IS_VALID(last) &&
       pts <= last) {
-    GstClockTime step = GST_BUFFER_DURATION_IS_VALID(buffer)
-                            ? GST_BUFFER_DURATION(buffer)
-                            : 1;
-    buffer = gst_buffer_make_writable(buffer);
-    GST_BUFFER_PTS(buffer) = last + step;
-    GST_PAD_PROBE_INFO_DATA(info) = buffer;
     GST_DEBUG_OBJECT(plugin,
-                     "Non-increasing PTS %" GST_TIME_FORMAT
-                     " moved to %" GST_TIME_FORMAT,
-                     GST_TIME_ARGS(pts), GST_TIME_ARGS(last + step));
-    pts = last + step;
+                     "Dropping frame with non-increasing PTS %" GST_TIME_FORMAT
+                     " (previous %" GST_TIME_FORMAT ")",
+                     GST_TIME_ARGS(pts), GST_TIME_ARGS(last));
+    return GST_PAD_PROBE_DROP;
   }
 
   if (GST_CLOCK_TIME_IS_VALID(pts)) {
