@@ -120,6 +120,9 @@ struct _GstProjectMPrivate {
   gboolean first_audio_received;
   guint64 render_frame_count;
 
+  /* PTS of the last buffer pushed downstream; see gst_projectm_src_probe(). */
+  GstClockTime last_out_pts;
+
   GPtrArray *timeline_entries;
   gint current_timeline_index;
   gboolean timeline_active;
@@ -1569,8 +1572,70 @@ void gst_projectm_get_property(GObject *object, guint property_id,
   }
 }
 
+/*
+ * Keep output PTS strictly increasing.
+ *
+ * GstAudioVisualizer stamps the first two video frames with the same PTS (0).
+ * x264enc tolerates that, but hardware encoders (nvh264enc, nvd3d11h264enc,
+ * mfh264enc) pass it through, h264parse then drops the PTS on the second
+ * frame, and mp4mux fails the whole render with "Buffer has no PTS".
+ *
+ * A buffer whose PTS is not past the previous one is dropped. Moving it one
+ * frame later instead (the first version of this fix) collides with the next
+ * frame, so the shift cascades, and adding a 33333333 ns duration three times
+ * lands 1 ns before the next real frame. mp4mux rounds both to the same tick,
+ * so the file still carried a duplicate PTS, at frame 4 instead of frame 1.
+ * Dropping leaves every other frame at its own time, keeps audio sync, and
+ * changes nothing for buffers that were already in order.
+ */
+static GstPadProbeReturn gst_projectm_src_probe(GstPad *pad,
+                                                GstPadProbeInfo *info,
+                                                gpointer user_data) {
+  GstProjectM *plugin = GST_PROJECTM(user_data);
+
+  if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_FLUSH) {
+    GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+    if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
+      plugin->priv->last_out_pts = GST_CLOCK_TIME_NONE;
+    }
+    return GST_PAD_PROBE_OK;
+  }
+
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buffer) {
+    return GST_PAD_PROBE_OK;
+  }
+
+  GstClockTime pts = GST_BUFFER_PTS(buffer);
+  GstClockTime last = plugin->priv->last_out_pts;
+
+  if (GST_CLOCK_TIME_IS_VALID(pts) && GST_CLOCK_TIME_IS_VALID(last) &&
+      pts <= last) {
+    GST_DEBUG_OBJECT(plugin,
+                     "Dropping frame with non-increasing PTS %" GST_TIME_FORMAT
+                     " (previous %" GST_TIME_FORMAT ")",
+                     GST_TIME_ARGS(pts), GST_TIME_ARGS(last));
+    return GST_PAD_PROBE_DROP;
+  }
+
+  if (GST_CLOCK_TIME_IS_VALID(pts)) {
+    plugin->priv->last_out_pts = pts;
+  }
+  return GST_PAD_PROBE_OK;
+}
+
 static void gst_projectm_init(GstProjectM *plugin) {
   plugin->priv = gst_projectm_get_instance_private(plugin);
+  plugin->priv->last_out_pts = GST_CLOCK_TIME_NONE;
+
+  GstPad *srcpad = gst_element_get_static_pad(GST_ELEMENT(plugin), "src");
+  if (srcpad) {
+    gst_pad_add_probe(srcpad,
+                      GST_PAD_PROBE_TYPE_BUFFER |
+                          GST_PAD_PROBE_TYPE_EVENT_FLUSH,
+                      gst_projectm_src_probe, plugin, NULL);
+    gst_object_unref(srcpad);
+  }
 
   plugin->priv->timeline_entries =
       g_ptr_array_new_with_free_func(gst_projectm_timeline_entry_free);
@@ -1664,6 +1729,7 @@ static void gst_projectm_gl_stop(GstGLBaseAudioVisualizer *src) {
   plugin->priv->timeline_initialized = FALSE;
   plugin->priv->first_frame_received = FALSE;
   plugin->priv->first_frame_time = GST_CLOCK_TIME_NONE;
+  plugin->priv->last_out_pts = GST_CLOCK_TIME_NONE;
   plugin->priv->headless_checked = FALSE;
   plugin->priv->headless_mode = FALSE;
 }
